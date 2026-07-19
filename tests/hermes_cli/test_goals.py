@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+import threading
 import time
 from unittest.mock import patch, MagicMock
 
@@ -1500,3 +1504,133 @@ class TestContractAndBackgroundCompose:
             )
         assert verdict == "done"
         assert wait_directive is None
+
+
+class TestDurableGoalExecutionLease:
+    def test_same_owner_cannot_claim_live_generation_twice(self, hermes_home):
+        from hermes_cli.goal_execution import GoalExecutionCoordinator
+
+        owner = GoalExecutionCoordinator(hermes_home, owner_id="shared-backend", clock=lambda: 100.0)
+        first = owner.claim("session-same-owner", 1)
+        assert first is not None
+        assert first.claim_token
+        assert owner.claim("session-same-owner", 1) is None
+
+    def test_concurrent_same_owner_claims_mint_exactly_one_fence(self, hermes_home):
+        from hermes_cli.goal_execution import GoalExecutionCoordinator
+
+        coordinators = [
+            GoalExecutionCoordinator(
+                hermes_home, owner_id="shared-backend", clock=lambda: 100.0
+            )
+            for _ in range(2)
+        ]
+        barrier = threading.Barrier(3)
+        results = []
+        errors = []
+
+        def claim_once(coordinator):
+            try:
+                barrier.wait(timeout=5)
+                results.append(coordinator.claim("session-concurrent", 1))
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=claim_once, args=(coordinator,))
+            for coordinator in coordinators
+        ]
+        for thread in threads:
+            thread.start()
+        barrier.wait(timeout=5)
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert errors == []
+        winners = [record for record in results if record is not None]
+        assert len(winners) == 1
+        assert winners[0].claim_token
+
+    def test_single_owner_cas_and_expired_takeover(self, hermes_home):
+        from hermes_cli.goal_execution import GoalExecutionCoordinator
+
+        first = GoalExecutionCoordinator(hermes_home, owner_id="backend-a", clock=lambda: 100.0)
+        second = GoalExecutionCoordinator(hermes_home, owner_id="backend-b", clock=lambda: 100.0)
+        assert first.claim("session-a", 7, lease_seconds=30) is not None
+        assert second.claim("session-a", 7, lease_seconds=30) is None
+        expired = GoalExecutionCoordinator(hermes_home, owner_id="backend-b", clock=lambda: 131.0)
+        assert expired.claim("session-a", 7, lease_seconds=30).owner_id == "backend-b"
+
+    def test_new_generation_invalidates_stale_owner(self, hermes_home):
+        from hermes_cli.goal_execution import GoalExecutionCoordinator
+
+        old = GoalExecutionCoordinator(hermes_home, owner_id="old", clock=lambda: 10.0)
+        new = GoalExecutionCoordinator(hermes_home, owner_id="new", clock=lambda: 10.0)
+        old_claim = old.claim("session-a", 1)
+        assert old_claim is not None
+        new.invalidate("session-a", 2)
+        assert old.heartbeat("session-a", 1, old_claim.claim_token) is False
+        assert old.claim("session-a", 1) is None
+        assert new.claim("session-a", 2) is not None
+
+    def test_stale_generation_invalidation_cannot_revoke_newer_claim(self, hermes_home):
+        from hermes_cli.goal_execution import GoalExecutionCoordinator
+
+        owner = GoalExecutionCoordinator(hermes_home, owner_id="new", clock=lambda: 10.0)
+        claimed = owner.claim("session-reverse", 2)
+        assert claimed is not None
+
+        assert owner.invalidate("session-reverse", 1) is False
+        current = owner.get("session-reverse")
+        assert current.claim_token == claimed.claim_token
+        assert owner.heartbeat("session-reverse", 2, claimed.claim_token) is True
+
+    def test_higher_generation_claim_resets_retry_metadata(self, hermes_home):
+        from hermes_cli.goal_execution import GoalExecutionCoordinator
+
+        owner = GoalExecutionCoordinator(hermes_home, owner_id="backend", clock=lambda: 10.0)
+        first = owner.claim("session-reset", 1)
+        assert owner.schedule(
+            "session-reset", 1, first.claim_token,
+            next_run_at=11.0, reason="old failure", increment_attempt=True,
+        )
+        replacement = owner.claim("session-reset", 2)
+        assert replacement is not None
+        assert replacement.attempt == 0
+        assert replacement.last_error is None
+
+    def test_wait_deadline_is_durable_and_due_only_after_deadline(self, hermes_home):
+        from hermes_cli.goal_execution import GoalExecutionCoordinator
+
+        owner = GoalExecutionCoordinator(hermes_home, owner_id="backend", clock=lambda: 50.0)
+        claim = owner.claim("session-a", 3)
+        assert claim is not None
+        assert owner.schedule(
+            "session-a", 3, claim.claim_token, next_run_at=75.0, reason="rate limit"
+        )
+        assert owner.due_records(now=74.9) == []
+        assert [r.session_id for r in owner.due_records(now=75.0)] == ["session-a"]
+
+    def test_fresh_process_recovers_expired_activation_from_temp_home(self, hermes_home):
+        """Recovery proof uses a new interpreter, not an in-process timer thread."""
+        from hermes_cli.goal_execution import GoalExecutionCoordinator
+        from hermes_cli.goals import GoalManager
+
+        state = GoalManager("restart-session").set("continue after restart")
+        crashed = GoalExecutionCoordinator(hermes_home, owner_id="dead-backend", clock=lambda: 10.0)
+        assert crashed.claim("restart-session", state.generation, lease_seconds=1)
+        script = r'''\
+import os
+from pathlib import Path
+from hermes_cli.goal_execution import GoalExecutionCoordinator
+c = GoalExecutionCoordinator(Path(os.environ["HERMES_HOME"]), owner_id="new-backend", clock=lambda: 20.0)
+claimed = c.recover_once(lambda record, state: print(record.session_id + ":" + state.goal))
+print("claimed=" + str(claimed))
+'''
+        env = dict(os.environ, HERMES_HOME=str(hermes_home), PYTHONPATH=os.getcwd())
+        result = subprocess.run(
+            [sys.executable, "-c", script], env=env, text=True, capture_output=True, check=True
+        )
+        assert "restart-session:continue after restart" in result.stdout
+        assert "claimed=1" in result.stdout

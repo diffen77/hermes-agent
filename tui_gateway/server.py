@@ -718,7 +718,20 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
     """
     if not session:
         return
-    _finalize_session(session, end_reason=end_reason)
+    history_lock = session.get("history_lock")
+    if history_lock is not None:
+        with history_lock:
+            _cancel_goal_continuation_locked(session)
+            _release_goal_execution_for_teardown(session, reason=end_reason)
+    else:
+        _release_goal_execution_for_teardown(session, reason=end_reason)
+    try:
+        _finalize_session(session, end_reason=end_reason)
+    except Exception:
+        # Lease release is deliberately completed before finalization. A
+        # plugin/memory/finalize failure must not leave a renewable owner that
+        # can fence restart recovery forever.
+        logger.debug("session finalization failed during teardown", exc_info=True)
     try:
         from tools.approval import unregister_gateway_notify
 
@@ -804,6 +817,10 @@ def _ws_session_is_orphaned(session: dict | None) -> bool:
         return False
     if session.get("running"):
         return False
+    # A detached Desktop/TUI runtime may be the only in-memory executor for a
+    # durable active goal. Its live lease, not its websocket, owns lifecycle.
+    if _session_has_goal_execution_owner(session):
+        return False
     return session.get("transport") is _detached_ws_transport
 
 
@@ -855,24 +872,31 @@ def _close_sessions_for_transport(
     independent reap loop in ``handle_ws``.
 
     Returns ``(reaped, detached)`` counts for disconnect-path observability."""
-    with _sessions_lock:
-        owned = [(sid, s) for sid, s in _sessions.items() if s.get("transport") is transport]
-    reaped = 0
-    detached = 0
-    for sid, session in owned:
-        if session.get("close_on_disconnect"):
-            _close_session_by_id(sid, end_reason=end_reason)
-            reaped += 1
-        else:
-            # Point detached sessions at the drop sentinel (NOT real stdio) so
-            # _ws_session_is_orphaned recognizes them and the grace-reap can
-            # actually fire; a standalone `hermes --tui` keeps real _stdio.
-            session["transport"] = _detached_ws_transport
-            detached += 1
-            try:
-                _schedule_ws_orphan_reap(sid)
-            except Exception:
-                pass
+    popped = []
+    detached_ids = []
+    # Resume and disconnect share one atomic transport-binding boundary.  Only
+    # dict inspection/mutation happens under the global locks; finalization and
+    # timer creation remain outside them.
+    with _session_resume_lock:
+        with _sessions_lock:
+            owned = [
+                (sid, s) for sid, s in _sessions.items() if s.get("transport") is transport
+            ]
+            for sid, session in owned:
+                if session.get("close_on_disconnect"):
+                    popped.append(_pop_session_by_id(sid))
+                else:
+                    session["transport"] = _detached_ws_transport
+                    detached_ids.append(sid)
+    for session in popped:
+        _teardown_popped_session(session, end_reason=end_reason)
+    for sid in detached_ids:
+        try:
+            _schedule_ws_orphan_reap(sid)
+        except Exception:
+            pass
+    reaped = len(popped)
+    detached = len(detached_ids)
     return reaped, detached
 
 
@@ -1009,7 +1033,6 @@ def _start_idle_reaper() -> None:
     threading.Thread(target=_loop, daemon=True).start()
 
 
-atexit.register(_shutdown_sessions)
 _start_idle_reaper()
 
 
@@ -1496,7 +1519,20 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             return normalized
 
         _rid, method, _params = normalized
-        if method not in _LONG_HANDLERS:
+        is_long = method in _LONG_HANDLERS
+        if method == "command.dispatch":
+            # Most command.dispatch handlers are intentionally ordered on the
+            # reader's fast path. /goal draft is the exception: it performs a
+            # bounded auxiliary-model call. Recognize the same exact command
+            # boundary as its handler so direct clients are offloaded; the
+            # slash.exec route is already in _LONG_HANDLERS.
+            command_arg = str(_params.get("arg") or "").strip().split(maxsplit=1)
+            is_long = (
+                str(_params.get("name") or "").strip().lstrip("/").lower() == "goal"
+                and bool(command_arg)
+                and command_arg[0].lower() == "draft"
+            )
+        if not is_long:
             return handle_request(req)
 
         # Snapshot the context so the pool worker sees the bound transport.
@@ -6031,7 +6067,9 @@ def _claim_or_reuse_live(
     resume lock, or — if a concurrent resume already won — release ``lease`` and
     return the winner for the caller to reuse."""
     with _session_resume_lock:
-        live = _find_live_session_by_key(session_key)
+        live = _find_live_session_by_key(
+            session_key, profile_home=record.get("profile_home")
+        )
         if live is not None:
             if lease is not None:
                 lease.release()
@@ -6143,9 +6181,9 @@ def _(rid, params: dict) -> dict:
             payload["status"] = "streaming"
         return payload
 
-    # Fast path: if the session is already live, reuse it under the lock.
+    # Fast path: if the session is already live in the requested profile, reuse it.
     with _session_resume_lock:
-        live = _find_live_session_by_key(target)
+        live = _find_live_session_by_key(target, profile_home=profile_home)
         if live is not None:
             return _ok(rid, _reuse_live_payload(*live))
 
@@ -6358,10 +6396,10 @@ def _(rid, params: dict) -> dict:
             reset_hermes_home_override(home_token)
 
     # Double-checked locking: another concurrent resume may have created the
-    # live session while we were building. Re-check under the lock; if it won,
-    # discard our just-built agent and reuse theirs (no worker/poller wired yet).
+    # live session while we were building. Re-check the same profile under the
+    # lock; if it won, discard our just-built agent.
     with _session_resume_lock:
-        live = _find_live_session_by_key(target)
+        live = _find_live_session_by_key(target, profile_home=profile_home)
         if live is not None:
             try:
                 if hasattr(agent, "close"):
@@ -6538,11 +6576,30 @@ def _session_lookup_key(session: dict, *, fallback: str = "") -> str:
     )
 
 
-def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
+_PROFILE_HOME_UNSPECIFIED = object()
+
+
+def _normalized_session_profile_home(profile_home=None) -> str:
+    home = get_hermes_home() if profile_home is None else Path(profile_home)
+    return str(Path(home).expanduser().resolve())
+
+
+def _find_live_session_by_key(
+    session_key: str, *, profile_home=_PROFILE_HOME_UNSPECIFIED
+) -> tuple[str, dict] | None:
+    wanted_home = (
+        None
+        if profile_home is _PROFILE_HOME_UNSPECIFIED
+        else _normalized_session_profile_home(profile_home)
+    )
     for sid, session in list(_sessions.items()):
         if session.get("_finalized"):
             continue
-        if _session_lookup_key(session, fallback=sid) == session_key:
+        session_home = _normalized_session_profile_home(session.get("profile_home"))
+        if (
+            _session_lookup_key(session, fallback=sid) == session_key
+            and (wanted_home is None or session_home == wanted_home)
+        ):
             return sid, session
     return None
 
@@ -8976,6 +9033,7 @@ def _(rid, params: dict) -> dict:
         with session["history_lock"]:
             session["_turn_cancel_requested"] = True
             session["queued_prompt"] = None
+            _cancel_goal_continuation_locked(session)
         _clear_pending(sid)
         try:
             from tools.approval import resolve_gateway_approval
@@ -9002,6 +9060,7 @@ def _(rid, params: dict) -> dict:
     with session["history_lock"]:
         session["_turn_cancel_requested"] = True
         session["queued_prompt"] = None
+        _cancel_goal_continuation_locked(session)
     if not run_thread_alive:
         with session["history_lock"]:
             if session.get("running"):
@@ -9288,6 +9347,854 @@ def _(rid, params: dict) -> dict:
 # ── Methods: prompt ──────────────────────────────────────────────────
 
 
+_GOAL_EMPTY_BACKOFF_BASE_S = 0.25
+_GOAL_EMPTY_BACKOFF_MAX_S = 2.0
+_GOAL_BACKEND_OWNER_ID = f"tui-backend-{uuid.uuid4().hex}"
+_GOAL_LEASE_SECONDS = 30.0
+_GOAL_RECOVERY_SCAN_S = 1.0
+_goal_coordinators = {}
+_goal_coordinator_inflight = {}
+_goal_coordinators_lock = threading.Lock()
+_goal_coordinator_closing = threading.Event()
+_goal_coordinator_generation = 0
+_GOAL_COORDINATOR_SHUTDOWN_TIMEOUT_S = 5.0
+_goal_recovery_supervisor = None
+_GOAL_RECOVERY_SUPERVISOR_KEY = "tui-gateway-goal-recovery"
+
+
+def _new_goal_execution_coordinator(home: Path):
+    from hermes_cli.goal_execution import GoalExecutionCoordinator
+
+    return GoalExecutionCoordinator(
+        home,
+        owner_id=_GOAL_BACKEND_OWNER_ID,
+        lease_seconds=_GOAL_LEASE_SECONDS,
+    )
+
+
+def _goal_execution_coordinator(session: dict | None = None):
+    home = Path((session or {}).get("profile_home") or get_hermes_home())
+    key = str(home)
+    while True:
+        with _goal_coordinators_lock:
+            if _goal_coordinator_closing.is_set():
+                raise RuntimeError("goal coordinator registry is shutting down")
+            coordinator = _goal_coordinators.get(key)
+            if coordinator is not None:
+                return coordinator
+            inflight = _goal_coordinator_inflight.get(key)
+            if inflight is None:
+                initialized = threading.Event()
+                initialization_generation = _goal_coordinator_generation
+                _goal_coordinator_inflight[key] = (
+                    initialized,
+                    initialization_generation,
+                )
+                break
+            initialized, _initialization_generation = inflight
+        initialized.wait()
+
+    try:
+        coordinator = _new_goal_execution_coordinator(home)
+    except BaseException:
+        with _goal_coordinators_lock:
+            if _goal_coordinator_inflight.get(key) == (
+                initialized,
+                initialization_generation,
+            ):
+                _goal_coordinator_inflight.pop(key, None)
+                initialized.set()
+        raise
+
+    publish = False
+    with _goal_coordinators_lock:
+        if _goal_coordinator_inflight.get(key) == (
+            initialized,
+            initialization_generation,
+        ):
+            publish = (
+                not _goal_coordinator_closing.is_set()
+                and initialization_generation == _goal_coordinator_generation
+            )
+            if publish:
+                _goal_coordinator_inflight.pop(key, None)
+                _goal_coordinators[key] = coordinator
+                initialized.set()
+    if publish:
+        return coordinator
+    try:
+        coordinator.close()
+    except Exception:
+        logger.debug("cancelled goal coordinator close failed", exc_info=True)
+    finally:
+        # Keep rejected construction visible as in-flight until its coordinator
+        # is fully closed. A timed-out shutdown must not be able to reopen the
+        # registry while this cancellation cleanup is still active.
+        with _goal_coordinators_lock:
+            if _goal_coordinator_inflight.get(key) == (
+                initialized,
+                initialization_generation,
+            ):
+                _goal_coordinator_inflight.pop(key, None)
+            # Signal even if another cleanup path already removed this token so
+            # every caller that observed it is released.
+            initialized.set()
+    raise RuntimeError("goal coordinator construction cancelled by shutdown")
+
+
+def _claim_goal_execution(session: dict, state) -> bool:
+    record = _goal_execution_coordinator(session).claim(
+        str(session.get("session_key") or ""), int(state.generation)
+    )
+    if record is None:
+        return False
+    generation = int(state.generation)
+    session["_goal_lease_generation"] = generation
+    session["_goal_lease_token"] = record.claim_token
+    session.pop("_goal_lease_lost", None)
+    _start_goal_lease_heartbeat(session, generation)
+    return True
+
+
+def _goal_heartbeat_wait(stop: threading.Event, seconds: float) -> bool:
+    """Injectable wait seam shared by the production and test heartbeat loop."""
+    return stop.wait(seconds)
+
+
+def _mark_goal_lease_lost(session: dict, generation: int, claim_token: str) -> None:
+    """Fence only the claim epoch that actually observed heartbeat loss."""
+    lock = session.get("history_lock")
+
+    def mark() -> None:
+        if (
+            session.get("_goal_lease_generation") == generation
+            and str(session.get("_goal_lease_token") or "") == claim_token
+        ):
+            session["_goal_lease_lost"] = True
+
+    if lock is None:
+        mark()
+    else:
+        with lock:
+            mark()
+
+
+def _goal_followup_allowed(
+    session: dict, generation: int | None = None, claim_token: str | None = None
+) -> bool:
+    """Return whether the exact locally-owned claim may persist or dispatch."""
+    if session.get("_finalized") or session.get("_goal_lease_lost"):
+        return False
+    current_generation = session.get("_goal_lease_generation")
+    current_token = str(session.get("_goal_lease_token") or "")
+    if generation is not None and current_generation != generation:
+        return False
+    if claim_token is not None and current_token != claim_token:
+        return False
+    return True
+
+
+def _heartbeat_goal_claim(session: dict, generation: int, claim_token: str) -> bool:
+    """Refresh and verify the exact claim, fencing it locally on CAS loss."""
+    if not _goal_followup_allowed(session, generation, claim_token):
+        return False
+    try:
+        owned = _goal_execution_coordinator(session).heartbeat(
+            str(session.get("session_key") or ""), generation, claim_token
+        )
+    except Exception:
+        logger.debug("goal lease heartbeat failed", exc_info=True)
+        _mark_goal_lease_lost(session, generation, claim_token)
+        return False
+    if not owned:
+        _mark_goal_lease_lost(session, generation, claim_token)
+        return False
+    return _goal_followup_allowed(session, generation, claim_token)
+
+
+def _start_goal_lease_heartbeat(session: dict, generation: int) -> None:
+    """Keep a lease live even when one model/tool turn runs for minutes."""
+    old_stop = session.pop("_goal_lease_heartbeat_stop", None)
+    if old_stop is not None:
+        old_stop.set()
+    stop = threading.Event()
+    session["_goal_lease_heartbeat_stop"] = stop
+    claim_token = str(session.get("_goal_lease_token") or "")
+
+    def loop() -> None:
+        while not _goal_heartbeat_wait(stop, max(1.0, _GOAL_LEASE_SECONDS / 3.0)):
+            if not _goal_followup_allowed(session, generation, claim_token):
+                return
+            if not _heartbeat_goal_claim(session, generation, claim_token):
+                return
+
+    threading.Thread(target=loop, name="goal-lease-heartbeat", daemon=True).start()
+
+
+def _release_goal_execution_for_teardown(session: dict, *, reason: str) -> bool:
+    """Stop renewal and durably schedule the exact active claim for recovery."""
+    if stop := session.pop("_goal_lease_heartbeat_stop", None):
+        stop.set()
+    generation = session.pop("_goal_lease_generation", None)
+    claim_token = str(session.pop("_goal_lease_token", "") or "")
+    session.pop("_goal_lease_lost", None)
+    session_key = str(session.get("session_key") or "")
+    if generation is None or not claim_token or not session_key:
+        return False
+    try:
+        return bool(
+            _goal_execution_coordinator(session).schedule(
+                session_key,
+                int(generation),
+                claim_token,
+                next_run_at=time.time() + _GOAL_RECOVERY_SCAN_S,
+                reason=f"session teardown: {reason}",
+            )
+        )
+    except Exception:
+        logger.debug("goal lease release failed during teardown", exc_info=True)
+        return False
+
+
+def _session_has_goal_execution_owner(session: dict | None) -> bool:
+    if not session:
+        return False
+    generation = session.get("_goal_lease_generation")
+    claim_token = str(session.get("_goal_lease_token") or "")
+    session_key = str(session.get("session_key") or "")
+    if (
+        generation is None
+        or not claim_token
+        or not session_key
+        or not _goal_followup_allowed(session, int(generation), claim_token)
+    ):
+        return False
+    try:
+        record = _goal_execution_coordinator(session).get(session_key)
+        return bool(
+            record
+            and record.generation == int(generation)
+            and record.owner_id == _GOAL_BACKEND_OWNER_ID
+            and record.claim_token == claim_token
+            and record.lease_expires_at > time.time()
+        )
+    except Exception:
+        # Fail safe for execution continuity: transient state.db trouble must
+        # not make the orphan reaper destroy the only runtime owner.
+        return True
+
+
+def _rearm_goal_orphan_reap(session: dict) -> None:
+    """Re-arm grace cleanup whenever a detached goal stops owning execution."""
+    if session.get("transport") is not _detached_ws_transport:
+        return
+    with _sessions_lock:
+        sid = next((key for key, value in _sessions.items() if value is session), None)
+    if sid:
+        _schedule_ws_orphan_reap(sid)
+
+
+def _invalidate_goal_execution(session: dict, state=None) -> None:
+    session_key = str(session.get("session_key") or "")
+    if not session_key:
+        return
+    try:
+        if state is None:
+            with _goal_profile_scope(session):
+                from hermes_cli.goals import GoalManager
+                state = GoalManager(session_key).state
+        generation = int(getattr(state, "generation", 1))
+        _goal_execution_coordinator(session).invalidate(session_key, generation)
+    finally:
+        session.pop("_goal_lease_generation", None)
+        if stop := session.pop("_goal_lease_heartbeat_stop", None):
+            stop.set()
+        _rearm_goal_orphan_reap(session)
+
+
+def _schedule_goal_execution_from_state(session: dict, state, *, reason: str = "") -> None:
+    """Release this backend lease into a durable timed/process wait."""
+    next_run_at = float(getattr(state, "waiting_until", 0.0) or 0.0)
+    if not next_run_at:
+        # Process-registry state is process-local. Poll while this backend lives;
+        # after restart a missing PID/session is classified ready by recover_once.
+        next_run_at = time.time() + _GOAL_RECOVERY_SCAN_S
+    generation = int(state.generation)
+    claim_token = str(session.get("_goal_lease_token") or "")
+    coordinator = _goal_execution_coordinator(session)
+    changed = coordinator.schedule(
+        str(session.get("session_key") or ""),
+        generation,
+        claim_token,
+        next_run_at=next_run_at,
+        reason=reason or str(getattr(state, "waiting_reason", "") or "goal wait"),
+    )
+    if not changed:
+        return
+
+    def clear_exact_claim() -> bool:
+        if (
+            session.get("_goal_lease_generation") != generation
+            or str(session.get("_goal_lease_token") or "") != claim_token
+        ):
+            return False
+        session.pop("_goal_lease_generation", None)
+        session.pop("_goal_lease_token", None)
+        if stop := session.pop("_goal_lease_heartbeat_stop", None):
+            stop.set()
+        return True
+
+    lock = session.get("history_lock")
+    if lock is None:
+        cleared = clear_exact_claim()
+    else:
+        with lock:
+            cleared = clear_exact_claim()
+    if cleared:
+        _rearm_goal_orphan_reap(session)
+
+
+def _retry_or_pause_goal_execution(session: dict, exc: BaseException) -> None:
+    """Convert failure only for the exact locally-owned claim epoch."""
+    session_key = str(session.get("session_key") or "")
+    generation = session.get("_goal_lease_generation")
+    claim_token = str(session.get("_goal_lease_token") or "")
+    if not session_key or generation is None or not claim_token:
+        return
+    generation = int(generation)
+    coordinator = _goal_execution_coordinator(session)
+    record = coordinator.get(session_key)
+    if (
+        record is None
+        or record.generation != generation
+        or record.owner_id != _GOAL_BACKEND_OWNER_ID
+        or record.claim_token != claim_token
+    ):
+        return
+
+    attempt = int(record.attempt) + 1
+    reason = f"continuation dispatch failed: {type(exc).__name__}: {exc}"
+    if attempt >= 5:
+        changed = coordinator.pause_after_failure(
+            session_key,
+            generation,
+            claim_token,
+            reason=f"recoverable blocker after 5 attempts — {reason}",
+        )
+    else:
+        changed = coordinator.schedule(
+            session_key,
+            generation,
+            claim_token,
+            next_run_at=time.time() + min(60.0, float(2 ** attempt)),
+            reason=reason,
+            increment_attempt=True,
+        )
+    if not changed:
+        return
+
+    # A concurrent local re-claim must not be cleared by this failed epoch.
+    if (
+        session.get("_goal_lease_generation") == generation
+        and str(session.get("_goal_lease_token") or "") == claim_token
+    ):
+        session.pop("_goal_lease_generation", None)
+        session.pop("_goal_lease_token", None)
+        if stop := session.pop("_goal_lease_heartbeat_stop", None):
+            stop.set()
+        _rearm_goal_orphan_reap(session)
+
+
+def _resume_goal_session_for_recovery(session_key: str, profile_home=None):
+    """Restore the canonical resumed runtime without a Desktop reconnect."""
+    with _session_resume_lock:
+        live = _find_live_session_by_key(session_key, profile_home=profile_home)
+    if live is not None:
+        return live
+    params = {"session_id": session_key, "source": "tui"}
+    if profile_home and Path(profile_home) != Path(get_hermes_home()):
+        params["profile"] = Path(profile_home).name
+    response = _methods["session.resume"](
+        f"goal-recovery-{uuid.uuid4().hex[:8]}",
+        params,
+    )
+    payload = response.get("result") or {}
+    sid = str(payload.get("session_id") or "")
+    session = _sessions.get(sid)
+    if not sid or session is None:
+        message = (response.get("error") or {}).get("message") or "session resume failed"
+        raise RuntimeError(message)
+    return sid, session
+
+
+def _recover_active_goals_once(coordinator=None) -> int:
+    """Claim expired/ownerless active goals and dispatch one normal user turn."""
+    coordinator = coordinator or _goal_execution_coordinator()
+
+    def dispatch(record, state) -> None:
+        sid, session = _resume_goal_session_for_recovery(
+            record.session_id, getattr(coordinator, "home", None)
+        )
+        with session["history_lock"]:
+            if session.get("running"):
+                raise RuntimeError("restored session is already running")
+            session["_goal_lease_generation"] = int(record.generation)
+            session["_goal_lease_token"] = record.claim_token
+            session["running"] = True
+        _start_goal_lease_heartbeat(session, int(record.generation))
+        prompt = state.goal
+        try:
+            from hermes_cli.goals import GoalManager
+            with _goal_profile_scope(session):
+                prompt = GoalManager(record.session_id).next_continuation_prompt()
+        except Exception:
+            pass
+
+        def run() -> None:
+            try:
+                _start_agent_build(sid, session)
+                err = _wait_agent(session, "goal-recovery")
+                if err:
+                    raise RuntimeError(
+                        err.get("error", {}).get("message", "agent initialization failed")
+                    )
+                _emit("message.start", sid)
+                _run_prompt_submit("goal-recovery", sid, session, prompt)
+            except Exception:
+                with session["history_lock"]:
+                    session["running"] = False
+                raise
+
+        # The recovery scan itself already runs off the RPC thread. Keeping this
+        # call synchronous makes dispatch failure visible to recover_once, which
+        # durably schedules bounded retry instead of losing the owner.
+        run()
+
+    return coordinator.recover_once(dispatch)
+
+
+def _start_goal_recovery_scheduler() -> None:
+    """Start the reload-safe, process-owned multi-profile supervisor once."""
+    global _goal_coordinator_generation, _goal_recovery_supervisor
+    from hermes_cli.goal_execution import (
+        GoalRecoverySupervisor,
+        get_goal_recovery_supervisor,
+    )
+
+    # Reopening is explicit and only valid after the prior shutdown drained all
+    # constructors. A timed-out shutdown keeps the gate closed.
+    with _goal_coordinators_lock:
+        if _goal_coordinator_inflight:
+            raise RuntimeError("cannot reopen goal coordinator registry during shutdown")
+        if _goal_coordinator_closing.is_set():
+            _goal_coordinator_generation += 1
+            _goal_coordinator_closing.clear()
+
+    def factory():
+        return GoalRecoverySupervisor(
+            get_hermes_home(),
+            coordinator_factory=lambda home: _goal_execution_coordinator(
+                {"profile_home": str(home)}
+            ),
+            recover_callback=_recover_active_goals_once,
+            scan_seconds=_GOAL_RECOVERY_SCAN_S,
+        )
+
+    _goal_recovery_supervisor = get_goal_recovery_supervisor(
+        _GOAL_RECOVERY_SUPERVISOR_KEY, factory
+    )
+    _goal_recovery_supervisor.start()
+
+
+def _shutdown_goal_recovery_scheduler() -> bool:
+    """Fence construction, stop recovery, close coordinators, and drain builders."""
+    global _goal_coordinator_generation, _goal_recovery_supervisor
+    from hermes_cli.goal_execution import clear_goal_recovery_supervisor
+
+    # Close the gate before waiting on the supervisor: neither new callers nor
+    # constructors already outside the lock may publish into this generation.
+    with _goal_coordinators_lock:
+        _goal_coordinator_generation += 1
+        _goal_coordinator_closing.set()
+        inflight = [entry[0] for entry in _goal_coordinator_inflight.values()]
+
+    supervisor = _goal_recovery_supervisor
+    if supervisor is not None:
+        if not supervisor.stop(timeout=5.0):
+            return False
+        _goal_recovery_supervisor = None
+        clear_goal_recovery_supervisor(_GOAL_RECOVERY_SUPERVISOR_KEY, supervisor)
+    with _goal_coordinators_lock:
+        coordinators = list(_goal_coordinators.values())
+        _goal_coordinators.clear()
+    already_closed = {id(item) for item in getattr(supervisor, "closed_coordinators", [])}
+    for coordinator in coordinators:
+        if id(coordinator) in already_closed:
+            continue
+        try:
+            coordinator.close()
+        except Exception:
+            logger.debug("goal coordinator close failed during shutdown", exc_info=True)
+
+    deadline = time.monotonic() + _GOAL_COORDINATOR_SHUTDOWN_TIMEOUT_S
+    for initialized in inflight:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not initialized.wait(remaining):
+            logger.warning("timed out waiting for goal coordinator initialization shutdown")
+            return False
+    return True
+
+
+def _shutdown_goal_runtime() -> bool:
+    """Release every live session claim before draining recovery-owned DBs."""
+    _shutdown_sessions()
+    return _shutdown_goal_recovery_scheduler()
+
+
+def _start_goal_continuation_timer(delay: float, callback):
+    """Start the injectable, daemon-safe timer used by empty goal turns."""
+    timer = threading.Timer(delay, callback)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
+def _cancel_goal_continuation_locked(session: dict, *, reset_backoff: bool = True) -> None:
+    """Invalidate the sole delayed continuation owner. Caller holds history_lock."""
+    session["_goal_continuation_generation"] = int(
+        session.get("_goal_continuation_generation", 0)
+    ) + 1
+    timer = session.pop("_goal_continuation_timer", None)
+    session.pop("_goal_continuation_owner", None)
+    if reset_backoff:
+        session["_goal_empty_success_streak"] = 0
+    if timer is not None:
+        timer.cancel()
+
+
+def _schedule_empty_goal_continuation(
+    rid,
+    sid: str,
+    session: dict,
+    prompt: str,
+    *,
+    goal_created_at: Any,
+    lease_generation: int | None = None,
+    lease_token: str | None = None,
+) -> None:
+    """Schedule one generation/session-bound continuation after empty success."""
+    from hermes_cli.goals import GoalManager
+
+    with session["history_lock"]:
+        if (
+            session.get("running")
+            or not _goal_followup_allowed(session, lease_generation, lease_token)
+        ):
+            return
+        _cancel_goal_continuation_locked(session, reset_backoff=False)
+        streak = int(session.get("_goal_empty_success_streak", 0)) + 1
+        session["_goal_empty_success_streak"] = streak
+        delay = _GOAL_EMPTY_BACKOFF_BASE_S
+        for _ in range(max(0, streak - 1)):
+            delay = min(delay * 2, _GOAL_EMPTY_BACKOFF_MAX_S)
+            if delay >= _GOAL_EMPTY_BACKOFF_MAX_S:
+                break
+        generation = int(session.get("_goal_continuation_generation", 0))
+        session_key = str(session.get("session_key") or "")
+        control_generation = int(session.get("_goal_control_generation", 0))
+        owner = {
+            "generation": generation,
+            "session_key": session_key,
+            "goal_created_at": goal_created_at,
+        }
+        session["_goal_continuation_owner"] = owner
+
+        def dispatch_continuation() -> None:
+            with session["history_lock"]:
+                current_owner = session.get("_goal_continuation_owner")
+                if (
+                    current_owner is not owner
+                    or int(session.get("_goal_continuation_generation", 0)) != generation
+                    or int(session.get("_goal_control_generation", 0))
+                    != control_generation
+                    or str(session.get("session_key") or "") != session_key
+                    or session.get("_finalized")
+                    or session.get("running")
+                    or not _goal_followup_allowed(
+                        session, lease_generation, lease_token
+                    )
+                    or _sessions.get(sid) is not session
+                ):
+                    return
+                with _goal_profile_scope(session):
+                    state = GoalManager(session_key).state
+                if (
+                    state is None
+                    or state.status != "active"
+                    or state.created_at != goal_created_at
+                    or state.turns_used >= state.max_turns
+                ):
+                    session.pop("_goal_continuation_timer", None)
+                    session.pop("_goal_continuation_owner", None)
+                    return
+                # Claim against session teardown atomically. A close that has
+                # already detached this sid wins; a later close sees running=True
+                # and tears down the already-claimed worker rather than a timer.
+                with _sessions_lock:
+                    if _sessions.get(sid) is not session:
+                        session.pop("_goal_continuation_timer", None)
+                        session.pop("_goal_continuation_owner", None)
+                        return
+                    session.pop("_goal_continuation_timer", None)
+                    session.pop("_goal_continuation_owner", None)
+                    session["running"] = True
+            try:
+                _emit("message.start", sid)
+                _run_prompt_submit(rid, sid, session, prompt)
+            except Exception as exc:
+                print(
+                    f"[tui_gateway] goal continuation dispatch failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+                with session["history_lock"]:
+                    session["running"] = False
+
+        session["_goal_continuation_timer"] = _start_goal_continuation_timer(
+            delay, dispatch_continuation
+        )
+
+
+@contextlib.contextmanager
+def _goal_profile_scope(session: dict):
+    """Resolve goal persistence against the same profile home as its turn."""
+    token = None
+    if profile_home := session.get("profile_home"):
+        token = set_hermes_home_override(profile_home)
+    try:
+        yield
+    finally:
+        if token is not None:
+            reset_hermes_home_override(token)
+
+
+def _new_pending_goal_activation(session: dict, payload: dict) -> dict:
+    """Create the one authoritative, single-use activation for this session."""
+    _cancel_goal_continuation_locked(session)
+    generation = int(session.get("_goal_activation_generation", 0)) + 1
+    session["_goal_activation_generation"] = generation
+    activation = dict(payload)
+    activation.update(
+        {
+            "token": uuid.uuid4().hex,
+            "generation": generation,
+            "session_key": str(session.get("session_key") or ""),
+        }
+    )
+    session["pending_goal_activation"] = activation
+    return activation
+
+
+def _invalidate_pending_goal_activation(session: dict) -> None:
+    session["_goal_activation_generation"] = int(
+        session.get("_goal_activation_generation", 0)
+    ) + 1
+    session.pop("pending_goal_activation", None)
+
+
+def _goal_activation_is_current(session: dict, candidate: dict) -> bool:
+    pending = session.get("pending_goal_activation")
+    return bool(
+        isinstance(pending, dict)
+        and candidate.get("token")
+        and candidate.get("token") == pending.get("token")
+        and candidate.get("generation") == pending.get("generation")
+        and candidate.get("session_key") == pending.get("session_key")
+        and candidate.get("session_key") == str(session.get("session_key") or "")
+    )
+
+
+def _rollback_unstarted_goal_activation(
+    session: dict, activated_goal, activation_kind: str | None, resume_snapshot
+) -> None:
+    """Undo only this submit's activation; later user transitions always win."""
+    if activated_goal is None:
+        return
+    try:
+        from hermes_cli.goals import GoalManager, save_goal
+
+        with _goal_profile_scope(session):
+            mgr = GoalManager(session.get("session_key") or "")
+            state = mgr.state
+            if (
+                state is None
+                or state.status != "active"
+                or state.created_at != activated_goal.created_at
+            ):
+                return
+            if activation_kind == "resume" and resume_snapshot is not None:
+                _, prior_status, prior_reason, prior_turns = resume_snapshot
+                state.status = prior_status
+                state.paused_reason = prior_reason
+                state.turns_used = prior_turns
+                save_goal(mgr.session_id, state)
+            else:
+                mgr.clear()
+    except Exception:
+        logger.debug("failed to roll back unstarted goal activation", exc_info=True)
+
+
+def _goal_control_transition(session: dict, operation: str, max_turns: int):
+    """Persist an explicit control and version it against in-flight judge saves."""
+    _cancel_goal_continuation_locked(session)
+    session["_goal_control_generation"] = int(
+        session.get("_goal_control_generation", 0)
+    ) + 1
+    session["_goal_control_override"] = operation
+    _invalidate_pending_goal_activation(session)
+    with _goal_profile_scope(session):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(
+            session_id=session.get("session_key") or "",
+            default_max_turns=max_turns,
+        )
+        if operation == "pause":
+            state = mgr.pause(reason="user-paused")
+            _invalidate_goal_execution(session, state)
+            return state
+        mgr.clear()
+        _invalidate_goal_execution(session)
+        return None
+
+
+def _evaluate_goal_turn(session: dict, raw: str, background_processes):
+    """Apply one bounded goal turn and reject stale judge persistence."""
+    from hermes_cli.goals import GoalManager, save_goal
+
+    try:
+        goals_cfg = _load_cfg().get("goals") or {}
+        max_turns = int(goals_cfg.get("max_turns", 20) or 20)
+    except Exception:
+        max_turns = 20
+    with session["history_lock"]:
+        control_generation = int(session.get("_goal_control_generation", 0))
+        lease_generation = session.get("_goal_lease_generation")
+        lease_token = str(session.get("_goal_lease_token") or "")
+        if not _goal_followup_allowed(session, lease_generation, lease_token):
+            return None
+    with _goal_profile_scope(session):
+        mgr = GoalManager(
+            session_id=session.get("session_key") or "",
+            default_max_turns=max_turns,
+        )
+        if not mgr.is_active():
+            return None
+        if lease_generation is not None and int(mgr.state.generation) != int(
+            lease_generation
+        ):
+            _mark_goal_lease_lost(session, int(lease_generation), lease_token)
+            return None
+        persistence_guard = (
+            lambda: _heartbeat_goal_claim(
+                session, int(lease_generation), lease_token
+            )
+        ) if lease_generation is not None and lease_token else None
+        if raw.strip():
+            decision = mgr.evaluate_after_turn(
+                raw,
+                user_initiated=True,
+                background_processes=background_processes,
+                persistence_guard=persistence_guard,
+            )
+            if decision.get("verdict") == "lease_lost":
+                return None
+        else:
+            # A truly empty successful response consumed a backend turn too.
+            # Avoid a pointless judge call, but consume the same bounded budget.
+            state = mgr.state
+            state.turns_used += 1
+            state.last_turn_at = time.time()
+            state.last_verdict = "continue"
+            state.last_reason = "backend returned an empty successful response"
+            if state.turns_used >= state.max_turns:
+                state.status = "paused"
+                state.paused_reason = (
+                    f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
+                )
+                decision = {
+                    "status": "paused",
+                    "should_continue": False,
+                    "continuation_prompt": None,
+                    "verdict": "continue",
+                    "reason": state.last_reason,
+                    "message": (
+                        f"⏸ Goal paused — {state.turns_used}/{state.max_turns} turns used. "
+                        "Use /goal resume to keep going, or /goal clear to stop."
+                    ),
+                }
+            else:
+                decision = {
+                    "status": "active",
+                    "should_continue": True,
+                    "continuation_prompt": mgr.next_continuation_prompt(),
+                    "verdict": "continue",
+                    "reason": state.last_reason,
+                    "message": (
+                        f"↻ Goal turn ended empty ({state.turns_used}/{state.max_turns}); "
+                        "continuing automatically."
+                    ),
+                }
+            if persistence_guard is not None and not persistence_guard():
+                return None
+            save_goal(mgr.session_id, state)
+            decision["_goal_created_at"] = state.created_at
+
+    with session["history_lock"]:
+        current_generation = int(session.get("_goal_control_generation", 0))
+        override = session.get("_goal_control_override")
+    if current_generation != control_generation and override in {"pause", "clear"}:
+        # The judge saved a snapshot loaded before the user's explicit command.
+        # Re-apply the newer transition after that stale write.
+        with _goal_profile_scope(session):
+            current = GoalManager(
+                session_id=session.get("session_key") or "",
+                default_max_turns=max_turns,
+            )
+            if override == "pause":
+                current.pause(reason="user-paused")
+            else:
+                current.clear()
+        return {
+            "status": "paused" if override == "pause" else "cleared",
+            "should_continue": False,
+            "continuation_prompt": None,
+            "verdict": "inactive",
+            "reason": f"user {override} won over stale goal judge",
+            "message": "",
+        }
+    with _goal_profile_scope(session):
+        persisted_state = GoalManager(
+            session_id=session.get("session_key") or "",
+            default_max_turns=max_turns,
+        ).state
+    if persisted_state is not None:
+        if decision.get("verdict") in {"wait", "waiting"}:
+            _schedule_goal_execution_from_state(
+                session, persisted_state, reason=decision.get("reason") or ""
+            )
+        elif decision.get("status") != "active":
+            _invalidate_goal_execution(session, persisted_state)
+        elif lease_generation is not None and lease_token and not _heartbeat_goal_claim(
+            session, int(lease_generation), lease_token
+        ):
+            return None
+    if decision.get("should_continue"):
+        decision["_goal_lease_generation"] = lease_generation
+        decision["_goal_lease_token"] = lease_token or None
+    return decision
+
+
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
@@ -9295,6 +10202,7 @@ def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
+    goal_activation = params.get("goal_activation")
     truncate_user_ordinal = params.get("truncate_before_user_ordinal")
     session, err = _sess_nowait(params, rid)
     if err:
@@ -9325,6 +10233,13 @@ def _(rid, params: dict) -> dict:
         # queue whose drain already ran.
 
     with session["history_lock"]:
+        # Re-check at the authoritative claim. Two callers can both observe
+        # idle in the loop above before either reaches this critical section.
+        if session.get("running"):
+            return _err(rid, 4009, "session busy — prompt was claimed concurrently")
+        # A real submitted prompt owns this boundary and invalidates any empty-
+        # success timer that was waiting to claim it.
+        _cancel_goal_continuation_locked(session)
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
         # racing the in-flight child on the same stored session (interleaved
@@ -9354,6 +10269,82 @@ def _(rid, params: dict) -> dict:
                     db.replace_messages(session["session_key"], truncated)
                 except Exception as exc:
                     print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
+        # ``command.dispatch`` only drafts the /goal send directive. The goal
+        # becomes authoritative here, in the same critical section that claims
+        # its kickoff turn. A dropped/rejected submit therefore cannot leave
+        # durable active state without an execution owner.
+        activated_goal = None
+        activation_kind = None
+        resume_snapshot = None
+        pending_activation = session.get("pending_goal_activation")
+        if goal_activation is None:
+            if (
+                isinstance(pending_activation, dict)
+                and str(pending_activation.get("goal") or "").strip()
+                == str(text or "").strip()
+            ):
+                goal_activation = pending_activation
+        if goal_activation is not None:
+            if not isinstance(goal_activation, dict):
+                return _err(rid, 4004, "goal_activation must be an object")
+            if not _goal_activation_is_current(session, goal_activation):
+                return _err(rid, 4004, "goal activation is stale or already consumed")
+            activation_goal = str(goal_activation.get("goal") or "").strip()
+            submitted_goal = str(text or "").strip()
+            if not activation_goal or activation_goal != submitted_goal:
+                return _err(rid, 4004, "goal activation does not match submitted prompt")
+            try:
+                from hermes_cli.goals import GoalContract, GoalManager
+
+                contract_data = goal_activation.get("contract")
+                contract = (
+                    GoalContract.from_dict(contract_data)
+                    if isinstance(contract_data, dict)
+                    else None
+                )
+                goals_cfg = _load_cfg().get("goals") or {}
+                max_turns = int(goals_cfg.get("max_turns", 20) or 20)
+                with _goal_profile_scope(session):
+                    goal_mgr = GoalManager(
+                        session_id=session.get("session_key") or "",
+                        default_max_turns=max_turns,
+                    )
+                    activation_kind = str(goal_activation.get("operation") or "set")
+                    if activation_kind == "resume":
+                        current = goal_mgr.state
+                        if (
+                            current is None
+                            or current.status == "cleared"
+                            or current.goal != activation_goal
+                        ):
+                            return _err(rid, 4004, "goal to resume is no longer available")
+                        resume_snapshot = (
+                            current.created_at,
+                            current.status,
+                            current.paused_reason,
+                            current.turns_used,
+                        )
+                        activated_goal = goal_mgr.resume()
+                    elif activation_kind == "set":
+                        activated_goal = goal_mgr.set(activation_goal, contract=contract)
+                    else:
+                        return _err(rid, 4004, "invalid goal activation operation")
+                session.pop("pending_goal_activation", None)
+            except (TypeError, ValueError) as exc:
+                return _err(rid, 4004, f"invalid goal activation: {exc}")
+            except Exception as exc:
+                return _err(rid, 5030, f"goal activation failed: {exc}")
+            if activated_goal is not None and not _claim_goal_execution(
+                session, activated_goal
+            ):
+                _rollback_unstarted_goal_activation(
+                    session, activated_goal, activation_kind, resume_snapshot
+                )
+                return _err(
+                    rid,
+                    4009,
+                    "goal execution is already owned by another live backend",
+                )
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
@@ -9391,11 +10382,17 @@ def _(rid, params: dict) -> dict:
             with session["history_lock"]:
                 session["running"] = False
                 _clear_inflight_turn(session)
+            _rollback_unstarted_goal_activation(
+                session, activated_goal, activation_kind, resume_snapshot
+            )
             return
         with session["history_lock"]:
             if session.get("_turn_cancel_requested") or not session.get("running"):
                 session["running"] = False
                 _clear_inflight_turn(session)
+                _rollback_unstarted_goal_activation(
+                    session, activated_goal, activation_kind, resume_snapshot
+                )
                 return
         _run_prompt_submit(rid, sid, session, text)
 
@@ -9833,6 +10830,10 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         goal_followup = None  # set by the post-turn goal hook below
+        goal_followup_is_empty_success = False
+        goal_followup_created_at = None
+        goal_followup_lease_generation = None
+        goal_followup_lease_token = None
         one_turn_restore = session.pop("one_turn_model_restore", None)
         try:
             from tools.approval import (
@@ -10092,50 +11093,43 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
-            # After every TUI turn, if a /goal is active, ask the judge
-            # whether the goal is done and — if not and we're still under
-            # budget — queue a continuation prompt to run after this
-            # thread releases session["running"]. The verdict message
-            # ("✓ Goal achieved" / "⏸ budget exhausted") is surfaced as
-            # a system line so the user sees progress regardless of
-            # outcome. Mirrors gateway/run._post_turn_goal_continuation.
-            if status == "complete" and isinstance(raw, str) and raw.strip():
+            # An active goal owns the next backend turn unless this boundary
+            # records an achieved/waiting verdict. A visible response is judged
+            # even when the turn also carries an error status. An empty failed
+            # turn is not terminal, so retry it directly without burning a
+            # judge/budget turn.
+            if isinstance(raw, str):
                 try:
-                    from hermes_cli.goals import GoalManager
+                    try:
+                        from hermes_cli.goals import gather_background_processes as _gather_bg
 
-                    sid_key = session.get("session_key") or ""
-                    if sid_key:
-                        try:
-                            goals_cfg = _load_cfg().get("goals") or {}
-                            goal_max_turns = int(goals_cfg.get("max_turns", 20) or 20)
-                        except Exception:
-                            goal_max_turns = 20
-                        goal_mgr = GoalManager(
-                            session_id=sid_key,
-                            default_max_turns=goal_max_turns,
-                        )
-                        if goal_mgr.is_active():
-                            try:
-                                from hermes_cli.goals import gather_background_processes as _gather_bg
-                                _bg_procs = _gather_bg()
-                            except Exception:
-                                _bg_procs = None
-                            decision = goal_mgr.evaluate_after_turn(
-                                raw,
-                                user_initiated=True,
-                                background_processes=_bg_procs,
+                        _bg_procs = _gather_bg()
+                    except Exception:
+                        _bg_procs = None
+                    if raw.strip():
+                        with session["history_lock"]:
+                            session["_goal_empty_success_streak"] = 0
+                    decision = _evaluate_goal_turn(session, raw, _bg_procs)
+                    if decision:
+                        verdict_msg = decision.get("message") or ""
+                        if verdict_msg:
+                            _emit(
+                                "status.update",
+                                sid,
+                                {"kind": "goal", "text": verdict_msg},
                             )
-                            verdict_msg = decision.get("message") or ""
-                            if verdict_msg:
-                                _emit(
-                                    "status.update",
-                                    sid,
-                                    {"kind": "goal", "text": verdict_msg},
-                                )
-                            if decision.get("should_continue"):
-                                cont_prompt = decision.get("continuation_prompt") or ""
-                                if cont_prompt:
-                                    goal_followup = cont_prompt
+                        if decision.get("should_continue"):
+                            goal_followup = decision.get("continuation_prompt") or None
+                            goal_followup_is_empty_success = (
+                                status == "complete" and not raw.strip()
+                            )
+                            goal_followup_created_at = decision.get("_goal_created_at")
+                            goal_followup_lease_generation = decision.get(
+                                "_goal_lease_generation"
+                            )
+                            goal_followup_lease_token = decision.get(
+                                "_goal_lease_token"
+                            )
                 except Exception as _goal_exc:
                     print(
                         f"[tui_gateway] goal continuation hook failed: "
@@ -10250,6 +11244,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
             )
             _emit("error", sid, {"message": str(e)})
+            _retry_or_pause_goal_execution(session, e)
         finally:
             if one_turn_restore:
                 try:
@@ -10271,6 +11266,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 session["running"] = False
                 session["last_active"] = time.time()
                 _clear_inflight_turn(session)
+            _rearm_goal_orphan_reap(session)
             _emit("session.info", sid, _session_info(agent, session))
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
@@ -10286,10 +11282,30 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         # prompt.submit sets running=True under the history_lock and
         # we check that guard before re-firing.
         if goal_followup:
+            if not _goal_followup_allowed(
+                session,
+                goal_followup_lease_generation,
+                goal_followup_lease_token,
+            ):
+                return
+            if goal_followup_is_empty_success and goal_followup_created_at:
+                _schedule_empty_goal_continuation(
+                    rid,
+                    sid,
+                    session,
+                    goal_followup,
+                    goal_created_at=goal_followup_created_at,
+                    lease_generation=goal_followup_lease_generation,
+                    lease_token=goal_followup_lease_token,
+                )
+                return
             with session["history_lock"]:
-                if session.get("running"):
-                    # User already sent something — their turn wins,
-                    # the judge will re-run on the next turn anyway.
+                if session.get("running") or not _goal_followup_allowed(
+                    session,
+                    goal_followup_lease_generation,
+                    goal_followup_lease_token,
+                ):
+                    # User already sent something or this exact claim was fenced.
                     return
                 session["running"] = True
             try:
@@ -10303,6 +11319,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 )
                 with session["history_lock"]:
                     session["running"] = False
+                _retry_or_pause_goal_execution(session, _cont_exc)
 
         # Drain completion notifications that arrived during this turn.
         # The background poller handles between-turn delivery; this is
@@ -13133,7 +14150,13 @@ def _(rid, params: dict) -> dict:
         if not session:
             return _err(rid, 4001, "no active session")
         try:
-            from hermes_cli.goals import GoalManager
+            from hermes_cli.goals import (
+                GoalContract,
+                GoalManager,
+                GoalState,
+                draft_contract,
+                parse_contract,
+            )
         except Exception as exc:
             return _err(rid, 5030, f"goals unavailable: {exc}")
 
@@ -13146,32 +14169,60 @@ def _(rid, params: dict) -> dict:
             max_turns = int(goals_cfg.get("max_turns", 20) or 20)
         except Exception:
             max_turns = 20
-        mgr = GoalManager(session_id=sid_key, default_max_turns=max_turns)
-
         lower = arg.strip().lower()
+        # Status/control commands do not make a model call. Load their manager
+        # at point of use; goal creation below deliberately waits until after a
+        # possible draft call so a long-running draft cannot later save stale
+        # state loaded before the session's active turn finished.
+        mgr = None
         if not arg.strip() or lower == "status":
-            return _ok(rid, {"type": "exec", "output": mgr.status_line()})
+            with _goal_profile_scope(session):
+                mgr = GoalManager(session_id=sid_key, default_max_turns=max_turns)
+                output = mgr.status_line()
+            return _ok(rid, {"type": "exec", "output": output})
         if lower == "pause":
-            state = mgr.pause(reason="user-paused")
+            with session["history_lock"]:
+                state = _goal_control_transition(session, "pause", max_turns)
             out = "No goal set." if state is None else f"⏸ Goal paused: {state.goal}"
             return _ok(rid, {"type": "exec", "output": out})
         if lower == "resume":
-            state = mgr.resume()
-            if state is None:
+            with _goal_profile_scope(session):
+                mgr = GoalManager(session_id=sid_key, default_max_turns=max_turns)
+                state = mgr.state
+            if state is None or state.status == "cleared":
                 return _ok(rid, {"type": "exec", "output": "No goal to resume."})
+            with session["history_lock"]:
+                if session.get("running"):
+                    return _err(
+                        rid,
+                        4009,
+                        "session busy — wait for the current turn before resuming the goal",
+                    )
+                pending = _new_pending_goal_activation(
+                    session,
+                    {
+                        "operation": "resume",
+                        "goal": state.goal,
+                        "contract": (
+                            state.contract.to_dict() if state.has_contract() else None
+                        ),
+                    },
+                )
             return _ok(
                 rid,
                 {
-                    "type": "exec",
-                    "output": (
-                        f"▶ Goal resumed: {state.goal}\n"
-                        "Send any message to continue, or wait — I'll take the next step on the next turn."
-                    ),
+                    "type": "send",
+                    "notice": f"▶ Goal resumed: {state.goal}",
+                    "message": state.goal,
+                    "goal_activation": pending,
                 },
             )
         if lower in {"clear", "stop", "done"}:
-            had = mgr.has_goal()
-            mgr.clear()
+            with session["history_lock"]:
+                with _goal_profile_scope(session):
+                    mgr = GoalManager(session_id=sid_key, default_max_turns=max_turns)
+                    had = mgr.has_goal()
+                _goal_control_transition(session, "clear", max_turns)
             return _ok(
                 rid,
                 {
@@ -13180,24 +14231,99 @@ def _(rid, params: dict) -> dict:
                 },
             )
 
-        # Otherwise — treat the remaining text as the new goal.
-        try:
-            state = mgr.set(arg)
-        except ValueError as exc:
-            return _err(rid, 4004, f"invalid goal: {exc}")
+        # A new goal is immediately returned as a kickoff prompt. Do not
+        # persist it when prompt.submit could not claim this session. Checking
+        # under the same lock as prompt.submit also prevents a running goal
+        # judge from racing this mutation.
+        with session["history_lock"]:
+            if session.get("running"):
+                return _err(
+                    rid,
+                    4009,
+                    "session busy — /interrupt the current turn before setting a goal",
+                )
+            if session.get("lazy") and _child_run_active(sid_key):
+                return _err(rid, 4009, "subagent still running — wait for it to finish")
+
+        arg_parts = arg.strip().split(maxsplit=1)
+        draft_requested = bool(arg_parts) and arg_parts[0].lower() == "draft"
+        if draft_requested:
+            objective = arg_parts[1].strip() if len(arg_parts) > 1 else ""
+            if not objective:
+                return _err(rid, 4004, "usage: /goal draft <objective in plain language>")
+            try:
+                contract = draft_contract(objective)
+            except Exception as exc:
+                logger.debug("goal contract draft failed: %s", exc)
+                contract = None
+            goal_text = objective
+        else:
+            goal_text, parsed_contract = parse_contract(arg)
+            if parsed_contract.is_empty():
+                # parse_contract normalizes headline lines. With no structured
+                # fields there is nothing to parse, so preserve the user's
+                # multiline free-form goal byte-for-byte (apart from the
+                # GoalManager's established outer trim).
+                goal_text = arg
+                contract = None
+            else:
+                contract = parsed_contract
+
+        # Re-check after the bounded model call, then load and save while the
+        # claim lock is held. A turn that started during drafting wins; no goal
+        # is persisted without an idle session available for its kickoff.
+        with session["history_lock"]:
+            if session.get("running"):
+                return _err(
+                    rid,
+                    4009,
+                    "session busy — /interrupt the current turn before setting a goal",
+                )
+            if session.get("lazy") and _child_run_active(sid_key):
+                return _err(rid, 4009, "subagent still running — wait for it to finish")
+            # Still a draft directive: prompt.submit owns the atomic activation
+            # and kickoff claim below the transport boundary.
+            try:
+                state = GoalState(
+                    goal=(goal_text or "").strip(),
+                    max_turns=max_turns,
+                    contract=contract if contract is not None else GoalContract(),
+                )
+                if not state.goal:
+                    raise ValueError("goal text is empty")
+                pending = _new_pending_goal_activation(
+                    session,
+                    {
+                        "goal": state.goal,
+                        "contract": (
+                            state.contract.to_dict() if state.has_contract() else None
+                        ),
+                    },
+                )
+            except ValueError as exc:
+                return _err(rid, 4004, f"invalid goal: {exc}")
 
         notice = (
             f"⊙ Goal set ({state.max_turns}-turn budget): {state.goal}\n"
             "I'll keep working until the goal is done, you pause/clear it, or the budget is exhausted.\n"
             "Controls: /goal status · /goal pause · /goal resume · /goal clear"
         )
+        if state.has_contract():
+            notice += f"\nCompletion contract:\n{state.contract.render_block()}"
+        elif draft_requested:
+            notice += "\n(Couldn't draft a contract — running as a free-form goal.)"
         # Send the goal text as the kickoff prompt. The TUI client sees
         # {type: send, notice, message} → renders `notice` as a sys line,
         # then submits `message` as a user turn. The post-turn judge
         # wired in _run_prompt_submit takes over from there.
         return _ok(
             rid,
-            {"type": "send", "notice": notice, "message": state.goal},
+            {
+                "type": "send",
+                "notice": notice,
+                "message": state.goal,
+                "goal_activation": pending,
+            },
         )
 
     if name == "undo":
@@ -15790,3 +16916,11 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5002, "command timed out (30s)")
     except Exception as e:
         return _err(rid, 5003, str(e))
+
+
+# Start only after every RPC method (especially session.resume) is registered.
+# Test suites call the injected one-shot scanner directly to avoid background
+# races; real Desktop/TUI backends begin restart/wait recovery at startup.
+atexit.register(_shutdown_goal_runtime)
+if "pytest" not in sys.modules:
+    _start_goal_recovery_scheduler()

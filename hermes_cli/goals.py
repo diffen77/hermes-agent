@@ -35,7 +35,8 @@ import re
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -390,6 +391,9 @@ class GoalState:
     """Serializable goal state stored per session."""
 
     goal: str
+    # Monotonic lifecycle generation used by the durable execution-lease CAS.
+    # Legacy rows load as generation 1.
+    generation: int = 1
     status: str = "active"          # active | paused | done | cleared
     turns_used: int = 0
     max_turns: int = DEFAULT_MAX_TURNS
@@ -448,6 +452,7 @@ class GoalState:
             subgoals = [str(s).strip() for s in raw_subgoals if str(s).strip()]
         return cls(
             goal=data.get("goal", ""),
+            generation=max(1, int(data.get("generation", 1) or 1)),
             status=data.get("status", "active"),
             turns_used=int(data.get("turns_used", 0) or 0),
             max_turns=int(data.get("max_turns", DEFAULT_MAX_TURNS) or DEFAULT_MAX_TURNS),
@@ -515,7 +520,7 @@ def _get_session_db() -> Optional[Any]:
     if cached is not None:
         return cached
     try:
-        db = SessionDB()
+        db = SessionDB(Path(home) / "state.db")
     except Exception as exc:  # pragma: no cover
         logger.debug("GoalManager: SessionDB() raised (%s)", exc)
         return None
@@ -587,18 +592,24 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
         state = load_goal(old_session_id)
         if state is None or getattr(state, "status", None) == "cleared":
             return False
-        # Don't clobber a goal already set on the child (e.g. a resumed
-        # lineage that re-established its own goal).
-        if load_goal(new_session_id) is not None:
+        db = _get_session_db()
+        if db is None:
             return False
-        save_goal(new_session_id, state)
-        # Archive the parent's row so it isn't double-counted as active.
-        clear_goal(old_session_id)
-        logger.debug(
-            "GoalManager: migrated goal %s -> %s (%s)",
-            old_session_id, new_session_id, reason or "rotation",
+        archived = GoalState.from_json(state.to_json())
+        archived.status = "cleared"
+        migrated = db.migrate_goal_state_and_lease(
+            old_session_id,
+            new_session_id,
+            active_goal_json=state.to_json(),
+            archived_goal_json=archived.to_json(),
+            generation=int(state.generation),
         )
-        return True
+        if migrated:
+            logger.debug(
+                "GoalManager: migrated goal and execution fence %s -> %s (%s)",
+                old_session_id, new_session_id, reason or "rotation",
+            )
+        return migrated
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("GoalManager: goal migration failed: %s", exc)
         return False
@@ -1128,8 +1139,10 @@ class GoalManager:
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal text is empty")
+        generation = (self._state.generation + 1) if self._state is not None else 1
         state = GoalState(
             goal=goal,
+            generation=generation,
             status="active",
             turns_used=0,
             max_turns=int(max_turns) if max_turns else self.default_max_turns,
@@ -1155,6 +1168,7 @@ class GoalManager:
     def pause(self, reason: str = "user-paused") -> Optional[GoalState]:
         if not self._state:
             return None
+        self._state.generation += 1
         self._state.status = "paused"
         self._state.paused_reason = reason
         # A wait barrier is meaningless once paused — drop it.
@@ -1169,6 +1183,7 @@ class GoalManager:
     def resume(self, *, reset_budget: bool = True) -> Optional[GoalState]:
         if not self._state:
             return None
+        self._state.generation += 1
         self._state.status = "active"
         self._state.paused_reason = None
         # Resuming starts fresh — clear any stale barrier.
@@ -1185,6 +1200,7 @@ class GoalManager:
     def clear(self) -> None:
         if self._state is None:
             return
+        self._state.generation += 1
         self._state.status = "cleared"
         save_goal(self.session_id, self._state)
         self._state = None
@@ -1192,6 +1208,7 @@ class GoalManager:
     def mark_done(self, reason: str) -> None:
         if not self._state:
             return
+        self._state.generation += 1
         self._state.status = "done"
         self._state.last_verdict = "done"
         self._state.last_reason = reason
@@ -1369,6 +1386,7 @@ class GoalManager:
         *,
         user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
+        persistence_guard: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         """Run the judge and update state. Return a decision dict.
 
@@ -1432,6 +1450,15 @@ class GoalManager:
             background_processes=background_processes,
             contract=state.contract if state.has_contract() else None,
         )
+        if persistence_guard is not None and not persistence_guard():
+            return {
+                "status": state.status,
+                "should_continue": False,
+                "continuation_prompt": None,
+                "verdict": "lease_lost",
+                "reason": "goal execution lease lost during judge",
+                "message": "",
+            }
         state.last_verdict = verdict
         state.last_reason = reason
 

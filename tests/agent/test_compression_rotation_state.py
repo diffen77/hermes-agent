@@ -90,6 +90,31 @@ class TestGoalMigratesOnRotation:
                 assert migrated.goal == "finish the migration"
             goals._DB_CACHE.clear()
 
+    def test_active_execution_fence_transfers_to_child_atomically(self, tmp_path: Path):
+        from hermes_cli.goal_execution import GoalExecutionCoordinator
+        import hermes_cli.goals as goals
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_GOAL_LEASE"
+        db.create_session(parent, source="tui")
+        agent = _build_agent_with_db(db, parent)
+        coordinator = GoalExecutionCoordinator(tmp_path, owner_id="backend", clock=lambda: 10.0)
+
+        with patch.object(goals, "_get_session_db", return_value=db):
+            state = goals.GoalState(goal="finish in flight")
+            goals.save_goal(parent, state)
+            claim = coordinator.claim(parent, state.generation)
+            assert claim is not None
+
+            agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+            child = agent.session_id
+
+        transferred = coordinator.get(child)
+        assert transferred is not None
+        assert transferred.claim_token == claim.claim_token
+        assert coordinator.heartbeat(child, state.generation, claim.claim_token) is True
+        assert coordinator.heartbeat(parent, state.generation, claim.claim_token) is False
+
 
 class TestOrphanRollbackOnCreateFailure:
     def test_rolls_back_to_parent_when_child_create_fails(self, tmp_path: Path):

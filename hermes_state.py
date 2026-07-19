@@ -862,6 +862,19 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS goal_execution_leases (
+    session_id TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL,
+    owner_id TEXT,
+    claim_token TEXT,
+    lease_expires_at REAL NOT NULL DEFAULT 0,
+    heartbeat_at REAL NOT NULL DEFAULT 0,
+    next_run_at REAL NOT NULL DEFAULT 0,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    updated_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS async_delegations (
     delegation_id TEXT PRIMARY KEY,
     origin_session TEXT NOT NULL,
@@ -889,6 +902,19 @@ CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_goal_execution_due
+    ON goal_execution_leases(next_run_at, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_goal_execution_scheduled
+    ON goal_execution_leases(next_run_at, session_id)
+    WHERE owner_id IS NULL AND next_run_at > 0;
+CREATE INDEX IF NOT EXISTS idx_goal_execution_expired
+    ON goal_execution_leases(lease_expires_at, session_id)
+    WHERE owner_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_goal_state_active
+    ON state_meta(key)
+    WHERE substr(key, 1, 5) = 'goal:'
+      AND json_valid(value)
+      AND json_extract(value, '$.status') = 'active';
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
@@ -1446,6 +1472,366 @@ class SessionDB:
                     logger.debug("WAL checkpoint (TRUNCATE) at close failed: %s", exc)
                 self._conn.close()
                 self._conn = None
+
+    # ── Durable /goal execution leases ──
+
+    def get_goal_execution_lease(self, session_id: str):
+        """Return one durable goal lease row through the public DB boundary."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM goal_execution_leases WHERE session_id = ?", (session_id,)
+            ).fetchone()
+
+    def claim_goal_execution_lease(
+        self,
+        session_id: str,
+        generation: int,
+        owner_id: str,
+        claim_token: str,
+        *,
+        now: float,
+        expires_at: float,
+    ):
+        """Atomically mint one claim epoch; every live claim blocks all claimers."""
+        generation = int(generation)
+
+        def write(conn):
+            row = conn.execute(
+                "SELECT * FROM goal_execution_leases WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            attempt = 0
+            last_error = None
+            if row is not None:
+                stored_generation = int(row["generation"])
+                if stored_generation > generation:
+                    return None
+                if stored_generation == generation:
+                    if row["owner_id"] and float(row["lease_expires_at"] or 0) > now:
+                        return None
+                    if float(row["next_run_at"] or 0) > now:
+                        return None
+                    attempt = int(row["attempt"] or 0)
+                    last_error = row["last_error"]
+            conn.execute(
+                """INSERT INTO goal_execution_leases
+                   (session_id, generation, owner_id, claim_token, lease_expires_at,
+                    heartbeat_at, next_run_at, attempt, last_error, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                   ON CONFLICT(session_id) DO UPDATE SET
+                     generation=excluded.generation, owner_id=excluded.owner_id,
+                     claim_token=excluded.claim_token,
+                     lease_expires_at=excluded.lease_expires_at,
+                     heartbeat_at=excluded.heartbeat_at, next_run_at=0,
+                     attempt=excluded.attempt, last_error=excluded.last_error,
+                     updated_at=excluded.updated_at""",
+                (
+                    session_id, generation, owner_id, claim_token, expires_at, now,
+                    attempt, last_error, now,
+                ),
+            )
+            return conn.execute(
+                "SELECT * FROM goal_execution_leases WHERE session_id = ?", (session_id,)
+            ).fetchone()
+
+        return self._execute_write(write)
+
+    def heartbeat_goal_execution_lease(
+        self, session_id: str, generation: int, owner_id: str, claim_token: str,
+        *, now: float, expires_at: float,
+    ) -> bool:
+        def write(conn):
+            cur = conn.execute(
+                """UPDATE goal_execution_leases
+                   SET heartbeat_at=?, lease_expires_at=?, updated_at=?
+                   WHERE session_id=? AND generation=? AND owner_id=? AND claim_token=?""",
+                (now, expires_at, now, session_id, int(generation), owner_id, claim_token),
+            )
+            return cur.rowcount == 1
+
+        return bool(self._execute_write(write))
+
+    def schedule_goal_execution_lease(
+        self, session_id: str, generation: int, owner_id: str, claim_token: str,
+        *, next_run_at: float, reason: str = "", increment_attempt: bool = False,
+        now: float,
+    ) -> bool:
+        def write(conn):
+            cur = conn.execute(
+                """UPDATE goal_execution_leases
+                   SET owner_id=NULL, claim_token=NULL, lease_expires_at=0, heartbeat_at=0,
+                       next_run_at=?, attempt=attempt+?, last_error=?, updated_at=?
+                   WHERE session_id=? AND generation=? AND owner_id=? AND claim_token=?""",
+                (
+                    float(next_run_at), 1 if increment_attempt else 0, reason or None, now,
+                    session_id, int(generation), owner_id, claim_token,
+                ),
+            )
+            return cur.rowcount == 1
+
+        return bool(self._execute_write(write))
+
+    def pause_goal_execution_after_failure(
+        self,
+        session_id: str,
+        generation: int,
+        owner_id: str,
+        claim_token: str,
+        *,
+        reason: str,
+        now: float,
+    ) -> bool:
+        """Pause only while the failed claim and active goal generation still match."""
+        generation = int(generation)
+
+        def write(conn):
+            lease = conn.execute(
+                """SELECT 1 FROM goal_execution_leases
+                   WHERE session_id=? AND generation=? AND owner_id=? AND claim_token=?""",
+                (session_id, generation, owner_id, claim_token),
+            ).fetchone()
+            goal_row = conn.execute(
+                "SELECT value FROM state_meta WHERE key=?", (f"goal:{session_id}",)
+            ).fetchone()
+            if lease is None or goal_row is None:
+                return False
+            try:
+                goal = json.loads(goal_row["value"])
+            except (TypeError, ValueError):
+                return False
+            if goal.get("status") != "active" or int(goal.get("generation", 1)) != generation:
+                return False
+
+            paused_generation = generation + 1
+            goal.update(
+                {
+                    "generation": paused_generation,
+                    "status": "paused",
+                    "paused_reason": reason,
+                    "waiting_on_pid": None,
+                    "waiting_on_session": None,
+                    "waiting_until": 0.0,
+                    "waiting_reason": None,
+                    "waiting_since": 0.0,
+                }
+            )
+            conn.execute(
+                "UPDATE state_meta SET value=? WHERE key=?",
+                (json.dumps(goal), f"goal:{session_id}"),
+            )
+            cur = conn.execute(
+                """UPDATE goal_execution_leases
+                   SET generation=?, owner_id=NULL, claim_token=NULL,
+                       lease_expires_at=0, heartbeat_at=0, next_run_at=0,
+                       attempt=0, last_error=NULL, updated_at=?
+                   WHERE session_id=? AND generation=? AND owner_id=? AND claim_token=?""",
+                (
+                    paused_generation,
+                    now,
+                    session_id,
+                    generation,
+                    owner_id,
+                    claim_token,
+                ),
+            )
+            return cur.rowcount == 1
+
+        return bool(self._execute_write(write))
+
+    def invalidate_goal_execution_lease(
+        self, session_id: str, generation: int, *, now: float,
+    ) -> bool:
+        """Invalidate equal/newer generations; stale generations are strict no-ops."""
+        generation = int(generation)
+
+        def write(conn):
+            row = conn.execute(
+                "SELECT generation FROM goal_execution_leases WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if row is not None and int(row["generation"]) > generation:
+                return False
+            conn.execute(
+                """INSERT INTO goal_execution_leases
+                   (session_id, generation, owner_id, claim_token, lease_expires_at,
+                    heartbeat_at, next_run_at, attempt, last_error, updated_at)
+                   VALUES (?, ?, NULL, NULL, 0, 0, 0, 0, NULL, ?)
+                   ON CONFLICT(session_id) DO UPDATE SET
+                     generation=excluded.generation, owner_id=NULL, claim_token=NULL,
+                     lease_expires_at=0, heartbeat_at=0, next_run_at=0,
+                     attempt=0, last_error=NULL, updated_at=excluded.updated_at""",
+                (session_id, generation, now),
+            )
+            return True
+
+        return bool(self._execute_write(write))
+
+    def due_goal_execution_leases(self, *, now: float, limit: int = 100):
+        """Return one deterministic, SQL-bounded batch of due execution leases."""
+        if isinstance(limit, bool):
+            raise ValueError("limit must be a positive integer")
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("limit must be a positive integer") from exc
+        if limit < 1:
+            raise ValueError("limit must be a positive integer")
+        scheduled_sql = """SELECT * FROM goal_execution_leases
+            WHERE owner_id IS NULL AND next_run_at > 0 AND next_run_at <= ?
+            ORDER BY next_run_at, session_id LIMIT ?"""
+        expired_sql = """SELECT * FROM goal_execution_leases
+            WHERE owner_id IS NOT NULL AND lease_expires_at <= ?
+            ORDER BY lease_expires_at, session_id LIMIT ?"""
+        with self._lock:
+            scheduled = self._conn.execute(scheduled_sql, (now, limit)).fetchall()
+            expired = self._conn.execute(expired_sql, (now, limit)).fetchall()
+        candidates = list(scheduled) + list(expired)
+        candidates.sort(
+            key=lambda row: (
+                float(row["next_run_at"] if row["owner_id"] is None else row["lease_expires_at"]),
+                str(row["session_id"]),
+            )
+        )
+        return candidates[:limit]
+
+    def explain_due_goal_execution_leases(self, *, now: float, limit: int = 100):
+        """Expose both bounded production plans for regression verification."""
+        with self._lock:
+            scheduled = self._conn.execute(
+                """EXPLAIN QUERY PLAN SELECT * FROM goal_execution_leases
+                   WHERE owner_id IS NULL AND next_run_at > 0 AND next_run_at <= ?
+                   ORDER BY next_run_at, session_id LIMIT ?""",
+                (now, limit),
+            ).fetchall()
+            expired = self._conn.execute(
+                """EXPLAIN QUERY PLAN SELECT * FROM goal_execution_leases
+                   WHERE owner_id IS NOT NULL AND lease_expires_at <= ?
+                   ORDER BY lease_expires_at, session_id LIMIT ?""",
+                (now, limit),
+            ).fetchall()
+        return scheduled, expired
+
+    def active_goal_state_rows(self, *, limit: int = 1000):
+        """Return only SQLite-filtered active goals for bounded bootstrap."""
+        with self._lock:
+            return self._conn.execute(
+                """SELECT key, value FROM state_meta
+                   WHERE substr(key, 1, 5) = 'goal:'
+                     AND json_valid(value)
+                     AND json_extract(value, '$.status') = 'active'
+                   ORDER BY key LIMIT ?""",
+                (max(1, int(limit)),),
+            ).fetchall()
+
+    def unreconciled_active_goal_state_rows(self, *, limit: int = 1000):
+        """Return one bounded page lacking an equal/newer execution fence."""
+        if isinstance(limit, bool):
+            raise ValueError("limit must be a positive integer")
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("limit must be a positive integer") from exc
+        if limit < 1:
+            raise ValueError("limit must be a positive integer")
+        with self._lock:
+            return self._conn.execute(
+                """SELECT s.key, s.value FROM state_meta AS s
+                   LEFT JOIN goal_execution_leases AS l
+                     ON l.session_id = substr(s.key, 6)
+                   WHERE substr(s.key, 1, 5) = 'goal:'
+                     AND json_valid(s.value)
+                     AND json_extract(s.value, '$.status') = 'active'
+                     AND (l.session_id IS NULL OR l.generation <
+                          COALESCE(json_extract(s.value, '$.generation'), 1))
+                   ORDER BY s.key LIMIT ?""",
+                (limit,),
+            ).fetchall()
+
+    def seed_goal_execution_lease(
+        self, session_id: str, generation: int, *, next_run_at: float, now: float
+    ) -> bool:
+        """Seed a missing/stale lease without disturbing an equal/newer fence."""
+        generation = int(generation)
+
+        def write(conn):
+            row = conn.execute(
+                "SELECT generation FROM goal_execution_leases WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is not None and int(row["generation"]) >= generation:
+                return False
+            conn.execute(
+                """INSERT INTO goal_execution_leases
+                   (session_id, generation, owner_id, claim_token, lease_expires_at,
+                    heartbeat_at, next_run_at, attempt, last_error, updated_at)
+                   VALUES (?, ?, NULL, NULL, 0, 0, ?, 0, NULL, ?)
+                   ON CONFLICT(session_id) DO UPDATE SET
+                     generation=excluded.generation, owner_id=NULL, claim_token=NULL,
+                     lease_expires_at=0, heartbeat_at=0,
+                     next_run_at=excluded.next_run_at, attempt=0, last_error=NULL,
+                     updated_at=excluded.updated_at""",
+                (session_id, generation, float(next_run_at), now),
+            )
+            return True
+
+        return bool(self._execute_write(write))
+
+    def migrate_goal_state_and_lease(
+        self,
+        old_session_id: str,
+        new_session_id: str,
+        *,
+        active_goal_json: str,
+        archived_goal_json: str,
+        generation: int,
+    ) -> bool:
+        """Atomically move goal state and any exact-generation execution fence."""
+        def write(conn):
+            child_goal = conn.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?", (f"goal:{new_session_id}",)
+            ).fetchone()
+            if child_goal is not None:
+                return False
+            parent_lease = conn.execute(
+                "SELECT * FROM goal_execution_leases WHERE session_id = ?", (old_session_id,)
+            ).fetchone()
+            child_lease = conn.execute(
+                "SELECT 1 FROM goal_execution_leases WHERE session_id = ?", (new_session_id,)
+            ).fetchone()
+            if child_lease is not None:
+                return False
+            if parent_lease is not None and int(parent_lease["generation"]) != int(generation):
+                return False
+            conn.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                (f"goal:{new_session_id}", active_goal_json),
+            )
+            conn.execute(
+                "UPDATE state_meta SET value=? WHERE key=?",
+                (archived_goal_json, f"goal:{old_session_id}"),
+            )
+            if parent_lease is not None:
+                conn.execute(
+                    """INSERT INTO goal_execution_leases
+                       (session_id, generation, owner_id, claim_token, lease_expires_at,
+                        heartbeat_at, next_run_at, attempt, last_error, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        new_session_id, parent_lease["generation"], parent_lease["owner_id"],
+                        parent_lease["claim_token"], parent_lease["lease_expires_at"],
+                        parent_lease["heartbeat_at"], parent_lease["next_run_at"],
+                        parent_lease["attempt"], parent_lease["last_error"],
+                        parent_lease["updated_at"],
+                    ),
+                )
+                conn.execute(
+                    """UPDATE goal_execution_leases
+                       SET owner_id=NULL, claim_token=NULL, lease_expires_at=0,
+                           heartbeat_at=0, next_run_at=0, updated_at=?
+                       WHERE session_id=?""",
+                    (parent_lease["updated_at"], old_session_id),
+                )
+            return True
+
+        return bool(self._execute_write(write))
 
     @staticmethod
     def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:

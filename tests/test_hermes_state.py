@@ -79,6 +79,42 @@ def db(tmp_path):
 # Session lifecycle
 # =========================================================================
 
+class TestGoalExecutionSchema:
+    def test_canonical_schema_owns_goal_execution_fence(self, db):
+        claimed = db.claim_goal_execution_lease(
+            "schema-session", 1, "owner", "fence-1", now=10.0, expires_at=20.0
+        )
+        assert claimed["claim_token"] == "fence-1"
+        assert db.get_goal_execution_lease("schema-session")["owner_id"] == "owner"
+
+    def test_legacy_goal_execution_table_adds_claim_token_on_reopen(self, tmp_path):
+        path = tmp_path / "legacy-goal.db"
+        initial = SessionDB(db_path=path)
+        initial.close()
+
+        import sqlite3
+        conn = sqlite3.connect(path)
+        conn.execute("DROP TABLE goal_execution_leases")
+        conn.execute(
+            """CREATE TABLE goal_execution_leases (
+                session_id TEXT PRIMARY KEY, generation INTEGER NOT NULL,
+                owner_id TEXT, lease_expires_at REAL NOT NULL DEFAULT 0,
+                heartbeat_at REAL NOT NULL DEFAULT 0, next_run_at REAL NOT NULL DEFAULT 0,
+                attempt INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at REAL NOT NULL
+            )"""
+        )
+        conn.commit()
+        conn.close()
+
+        migrated = SessionDB(db_path=path)
+        try:
+            claimed = migrated.claim_goal_execution_lease(
+                "legacy-session", 1, "owner", "migrated-fence", now=1.0, expires_at=2.0
+            )
+            assert claimed["claim_token"] == "migrated-fence"
+        finally:
+            migrated.close()
+
 class TestSessionLifecycle:
     def test_create_and_get_session(self, db):
         sid = db.create_session(
