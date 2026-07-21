@@ -1475,6 +1475,140 @@ class SessionDB:
 
     # ── Durable /goal execution leases ──
 
+    def allocate_goal_state(self, session_id: str, goal_json: str, *, now: float):
+        """Atomically allocate the next lifecycle generation and seed its lease."""
+        key = f"goal:{session_id}"
+
+        def write(conn):
+            current = conn.execute(
+                "SELECT value FROM state_meta WHERE key=?", (key,)
+            ).fetchone()
+            generation = 0
+            if current is not None:
+                try:
+                    generation = int(json.loads(current["value"]).get("generation", 1))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    generation = 0
+            goal = json.loads(goal_json)
+            generation += 1
+            goal["generation"] = generation
+            encoded = json.dumps(goal)
+            conn.execute(
+                """INSERT INTO state_meta(key, value) VALUES (?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (key, encoded),
+            )
+            next_run_at = float(goal.get("waiting_until") or 1.0)
+            conn.execute(
+                """INSERT INTO goal_execution_leases
+                   (session_id, generation, owner_id, claim_token, lease_expires_at,
+                    heartbeat_at, next_run_at, attempt, last_error, updated_at)
+                   VALUES (?, ?, NULL, NULL, 0, 0, ?, 0, NULL, ?)
+                   ON CONFLICT(session_id) DO UPDATE SET
+                     generation=excluded.generation, owner_id=NULL, claim_token=NULL,
+                     lease_expires_at=0, heartbeat_at=0, next_run_at=excluded.next_run_at,
+                     attempt=0, last_error=NULL, updated_at=excluded.updated_at""",
+                (session_id, generation, next_run_at, now),
+            )
+            return encoded
+
+        return self._execute_write(write)
+
+    def compare_and_set_goal_state(
+        self,
+        session_id: str,
+        expected_generation: int,
+        goal_json: str,
+        *,
+        now: float,
+        owner_id: str | None = None,
+        claim_token: str | None = None,
+    ):
+        """Persist one exact-generation state transition and reconcile its lease."""
+        if bool(owner_id) != bool(claim_token):
+            raise ValueError("owner_id and claim_token must be supplied together")
+        expected_generation = int(expected_generation)
+        key = f"goal:{session_id}"
+
+        def write(conn):
+            row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
+            if row is None:
+                return None
+            try:
+                current = json.loads(row["value"])
+                stored_generation = int(current.get("generation", 1))
+                goal = json.loads(goal_json)
+                new_generation = int(goal.get("generation", expected_generation))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            if stored_generation != expected_generation or new_generation < expected_generation:
+                return None
+            lease = conn.execute(
+                "SELECT * FROM goal_execution_leases WHERE session_id=?", (session_id,)
+            ).fetchone()
+            if lease is not None and int(lease["generation"]) > expected_generation:
+                return None
+            if (
+                new_generation == expected_generation
+                and lease is not None
+                and lease["owner_id"] is not None
+                and owner_id is None
+            ):
+                return None
+            if owner_id is not None and (
+                lease is None
+                or int(lease["generation"]) != expected_generation
+                or lease["owner_id"] != owner_id
+                or lease["claim_token"] != claim_token
+            ):
+                return None
+
+            encoded = json.dumps(goal)
+            conn.execute("UPDATE state_meta SET value=? WHERE key=?", (encoded, key))
+            active = goal.get("status") == "active"
+            if active and new_generation == expected_generation and lease is not None:
+                if lease["owner_id"] is None:
+                    conn.execute(
+                        """UPDATE goal_execution_leases
+                           SET next_run_at=?, updated_at=?
+                           WHERE session_id=? AND generation=? AND owner_id IS NULL""",
+                        (
+                            float(goal.get("waiting_until") or 1.0),
+                            now,
+                            session_id,
+                            expected_generation,
+                        ),
+                    )
+                return encoded
+            if active:
+                next_run_at = float(goal.get("waiting_until") or 1.0)
+                conn.execute(
+                    """INSERT INTO goal_execution_leases
+                       (session_id, generation, owner_id, claim_token, lease_expires_at,
+                        heartbeat_at, next_run_at, attempt, last_error, updated_at)
+                       VALUES (?, ?, NULL, NULL, 0, 0, ?, 0, NULL, ?)
+                       ON CONFLICT(session_id) DO UPDATE SET
+                         generation=excluded.generation, owner_id=NULL, claim_token=NULL,
+                         lease_expires_at=0, heartbeat_at=0, next_run_at=excluded.next_run_at,
+                         attempt=0, last_error=NULL, updated_at=excluded.updated_at""",
+                    (session_id, new_generation, next_run_at, now),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO goal_execution_leases
+                       (session_id, generation, owner_id, claim_token, lease_expires_at,
+                        heartbeat_at, next_run_at, attempt, last_error, updated_at)
+                       VALUES (?, ?, NULL, NULL, 0, 0, 0, 0, NULL, ?)
+                       ON CONFLICT(session_id) DO UPDATE SET
+                         generation=excluded.generation, owner_id=NULL, claim_token=NULL,
+                         lease_expires_at=0, heartbeat_at=0, next_run_at=0,
+                         attempt=0, last_error=NULL, updated_at=excluded.updated_at""",
+                    (session_id, new_generation, now),
+                )
+            return encoded
+
+        return self._execute_write(write)
+
     def get_goal_execution_lease(self, session_id: str):
         """Return one durable goal lease row through the public DB boundary."""
         with self._lock:
@@ -1782,9 +1916,18 @@ class SessionDB:
         active_goal_json: str,
         archived_goal_json: str,
         generation: int,
+        expected_source_goal_json: str,
     ) -> bool:
         """Atomically move goal state and any exact-generation execution fence."""
         def write(conn):
+            parent_goal = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (f"goal:{old_session_id}",)
+            ).fetchone()
+            if (
+                parent_goal is None
+                or parent_goal["value"] != expected_source_goal_json
+            ):
+                return False
             child_goal = conn.execute(
                 "SELECT 1 FROM state_meta WHERE key = ?", (f"goal:{new_session_id}",)
             ).fetchone()

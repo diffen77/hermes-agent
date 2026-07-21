@@ -87,6 +87,69 @@ class TestGoalExecutionSchema:
         assert claimed["claim_token"] == "fence-1"
         assert db.get_goal_execution_lease("schema-session")["owner_id"] == "owner"
 
+    def test_goal_state_cas_is_fenced_by_generation_and_exact_claim(self, db):
+        import json
+
+        active = json.dumps({"goal": "work", "status": "active", "generation": 0})
+        saved = db.allocate_goal_state("cas-session", active, now=10.0)
+        assert json.loads(saved)["generation"] == 1
+        claim = db.claim_goal_execution_lease(
+            "cas-session", 1, "owner", "claim-a", now=10.0, expires_at=20.0
+        )
+        assert claim is not None
+        progress = json.dumps(
+            {"goal": "work", "status": "active", "generation": 1, "turns_used": 1}
+        )
+
+        assert db.compare_and_set_goal_state(
+            "cas-session", 1, progress, now=11.0
+        ) is None
+        assert db.compare_and_set_goal_state(
+            "cas-session", 1, progress, now=11.0, owner_id="owner", claim_token="wrong"
+        ) is None
+        assert db.compare_and_set_goal_state(
+            "cas-session", 1, progress, now=11.0, owner_id="owner", claim_token="claim-a"
+        ) is not None
+
+        paused = json.dumps({"goal": "work", "status": "paused", "generation": 2})
+        assert db.compare_and_set_goal_state("cas-session", 1, paused, now=12.0) is not None
+        lease = db.get_goal_execution_lease("cas-session")
+        assert lease["generation"] == 2
+        assert lease["owner_id"] is None
+        assert lease["next_run_at"] == 0
+        assert db.compare_and_set_goal_state(
+            "cas-session", 1, progress, now=13.0, owner_id="owner", claim_token="claim-a"
+        ) is None
+
+    def test_migration_rejects_same_generation_parent_change_from_loaded_snapshot(self, db):
+        import json
+
+        source = json.dumps(
+            {"goal": "work", "status": "active", "generation": 0, "turns_used": 0}
+        )
+        loaded_snapshot = db.allocate_goal_state("snapshot-parent", source, now=10.0)
+        progress = json.dumps(
+            {"goal": "work", "status": "active", "generation": 1, "turns_used": 7}
+        )
+        assert db.compare_and_set_goal_state(
+            "snapshot-parent", 1, progress, now=11.0
+        ) is not None
+        archived = json.loads(loaded_snapshot)
+        archived["status"] = "cleared"
+
+        migrated = db.migrate_goal_state_and_lease(
+            "snapshot-parent",
+            "snapshot-child",
+            active_goal_json=loaded_snapshot,
+            archived_goal_json=json.dumps(archived),
+            generation=1,
+            expected_source_goal_json=loaded_snapshot,
+        )
+
+        assert migrated is False
+        assert json.loads(db.get_meta("goal:snapshot-parent"))["turns_used"] == 7
+        assert db.get_meta("goal:snapshot-child") is None
+
     def test_legacy_goal_execution_table_adds_claim_token_on_reopen(self, tmp_path):
         path = tmp_path / "legacy-goal.db"
         initial = SessionDB(db_path=path)

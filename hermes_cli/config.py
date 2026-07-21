@@ -2382,6 +2382,8 @@ DEFAULT_CONFIG = {
         # negatives (goal actually done but judge says continue) and
         # unbounded model spend on fuzzy / unachievable goals.
         "max_turns": 20,
+        # Bound simultaneous durable recovery turns across all profiles.
+        "recovery_max_concurrency": 8,
     },
 
     # Mixture of Agents — named presets used by /moa. A preset is an execution

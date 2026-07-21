@@ -370,6 +370,24 @@ def test_empty_successful_goal_turns_use_progressive_capped_backoff_before_budge
     assert len(calls) == 6
 
 
+def test_claimed_empty_success_is_durable_before_continuation(
+    server, session, hermes_home
+):
+    from hermes_cli.goals import GoalManager
+
+    _, session_key, s = session
+    state = GoalManager(session_key, default_max_turns=5).set("persist before continuing")
+    assert server._claim_goal_execution(s, state)
+
+    decision = server._evaluate_goal_turn(s, "", [])
+
+    durable = GoalManager(session_key).state
+    assert decision is not None
+    assert decision["should_continue"] is True
+    assert durable.turns_used == 1
+    assert durable.last_verdict == "continue"
+
+
 def test_empty_success_backoff_caps_without_overflow_at_large_configured_budget(
     server, session, monkeypatch
 ):
@@ -1018,6 +1036,7 @@ def test_teardown_stops_heartbeat_and_durably_releases_active_goal(
 def test_goal_runtime_shutdown_releases_sessions_before_closing_all_coordinators(
     server, session, monkeypatch
 ):
+    from hermes_cli import goals
     from hermes_cli.goals import GoalManager
 
     _, session_key, s = session
@@ -1029,6 +1048,7 @@ def test_goal_runtime_shutdown_releases_sessions_before_closing_all_coordinators
     events = []
     original_schedule = coordinator.schedule
     original_close = coordinator.close
+    original_clear = getattr(goals, "_clear_db_cache")
 
     def schedule(*args, **kwargs):
         events.append("release")
@@ -1038,17 +1058,149 @@ def test_goal_runtime_shutdown_releases_sessions_before_closing_all_coordinators
         events.append("close")
         return original_close()
 
+    def clear_cache(*, close=False):
+        events.append("cache")
+        return original_clear(close=close)
+
     monkeypatch.setattr(coordinator, "schedule", schedule)
     monkeypatch.setattr(coordinator, "close", close)
+    monkeypatch.setattr(goals, "_clear_db_cache", clear_cache)
     monkeypatch.setattr(server, "_finalize_session", lambda sess, **_kw: None)
 
     server._shutdown_goal_runtime()
 
-    assert events == ["release", "close"]
+    assert events == ["release", "close", "cache"]
     assert server._sessions == {}
     assert server._goal_coordinators == {}
     assert server._goal_coordinator_inflight == {}
     assert coordinator.db._conn is None
+    assert goals._DB_CACHE == {}
+
+
+def test_goal_runtime_shutdown_closes_recovery_admission_before_session_snapshot(
+    server, monkeypatch
+):
+    resume_error = []
+    resume_calls = []
+    lease_releases = []
+    events = []
+    shutdown_results = []
+    monkeypatch.setattr(server, "_goal_coordinator_closing", threading.Event())
+    monkeypatch.setattr(server, "_goal_recovery_supervisor", None)
+    monkeypatch.setattr(server, "_sessions", {})
+    monkeypatch.setitem(
+        server._methods,
+        "session.resume",
+        lambda *_args: resume_calls.append("resume") or {"result": {}},
+    )
+
+    # Put recovery past its lifecycle claim and block it at the existing resume
+    # serialization seam. Shutdown must close the shared gate, wait for that
+    # claim, and only then snapshot sessions. When released, recovery rechecks
+    # the gate inside resume admission and cannot call session.resume at all.
+    server._session_resume_lock.acquire()
+
+    def resume():
+        try:
+            server._resume_goal_session_for_recovery("late-session")
+        except BaseException as exc:
+            resume_error.append(exc)
+        finally:
+            # Model the already-claimed recovery lease's failure cleanup.
+            lease_releases.append("scheduled")
+
+    worker = threading.Thread(target=resume)
+    worker.start()
+    deadline = time.monotonic() + 5
+    while server._goal_recovery_admissions != 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert server._goal_recovery_admissions == 1
+
+    original_shutdown_sessions = server._shutdown_sessions
+
+    def snapshot_sessions():
+        events.append("sessions")
+        original_shutdown_sessions()
+
+    monkeypatch.setattr(server, "_shutdown_sessions", snapshot_sessions)
+    shutdown = threading.Thread(
+        target=lambda: shutdown_results.append(server._shutdown_goal_runtime())
+    )
+    shutdown.start()
+    assert server._goal_coordinator_closing.wait(timeout=5)
+    assert events == []
+
+    server._session_resume_lock.release()
+    worker.join(timeout=5)
+    shutdown.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert not shutdown.is_alive()
+    assert shutdown_results == [True]
+    assert len(resume_error) == 1
+    assert isinstance(resume_error[0], RuntimeError)
+    assert "shutting down" in str(resume_error[0])
+    assert resume_calls == []
+    assert lease_releases == ["scheduled"]
+    assert events == ["sessions"]
+    assert server._sessions == {}
+
+
+def test_session_resume_admission_and_shutdown_drain_without_deadlock(
+    server, monkeypatch
+):
+    entered_db = threading.Event()
+    release_db = threading.Event()
+    events = []
+    responses = []
+    shutdown_results = []
+    monkeypatch.setattr(server, "_goal_coordinator_closing", threading.Event())
+    monkeypatch.setattr(server, "_goal_recovery_supervisor", None)
+    monkeypatch.setattr(server, "_sessions", {})
+    monkeypatch.setattr(server, "_profile_home", lambda _profile: None)
+
+    class SlowDB:
+        def get_session(self, _target):
+            entered_db.set()
+            assert release_db.wait(timeout=5)
+            return None
+
+        def get_session_by_title(self, _target):
+            return None
+
+    monkeypatch.setattr(server, "_get_db", lambda: SlowDB())
+    resume = threading.Thread(
+        target=lambda: responses.append(
+            server._methods["session.resume"]("resume-rid", {"session_id": "missing"})
+        )
+    )
+    resume.start()
+    assert entered_db.wait(timeout=5)
+
+    original_shutdown_sessions = server._shutdown_sessions
+
+    def snapshot_sessions():
+        events.append("sessions")
+        original_shutdown_sessions()
+
+    monkeypatch.setattr(server, "_shutdown_sessions", snapshot_sessions)
+    shutdown = threading.Thread(
+        target=lambda: shutdown_results.append(server._shutdown_goal_runtime())
+    )
+    shutdown.start()
+    assert server._goal_coordinator_closing.wait(timeout=5)
+    assert events == []
+
+    release_db.set()
+    resume.join(timeout=5)
+    shutdown.join(timeout=5)
+
+    assert not resume.is_alive()
+    assert not shutdown.is_alive()
+    assert responses[0]["error"]["message"] == "session not found"
+    assert shutdown_results == [True]
+    assert events == ["sessions"]
+    assert server._sessions == {}
 
 
 def test_shutdown_waits_for_inflight_constructor_and_cancels_its_publication(
@@ -1394,8 +1546,589 @@ def test_restart_recovery_reconstructs_normal_next_user_turn(
         restored["running"] = False
     monkeypatch.setattr(server, "_run_prompt_submit", run)
 
-    assert server._recover_active_goals_once(fresh) == 1
+    result = server._recover_active_goals_once(fresh)
+    assert result.accepted == 1
+    assert result.completed == 0
+    assert server._drain_goal_recovery_turns(timeout=2.0) is True
     assert prompts == [GoalManager(session_key).next_continuation_prompt()]
+
+
+def test_recovery_turns_are_nonblocking_single_flight_and_drain_exactly(
+    server, hermes_home, monkeypatch
+):
+    from hermes_cli.goal_execution import GoalExecutionCoordinator
+    from hermes_cli.goals import GoalManager
+
+    first = GoalManager("blocked-a1").set("first")
+    second = GoalManager("later-a2").set("second")
+    coordinator = GoalExecutionCoordinator(
+        hermes_home,
+        owner_id=server._GOAL_BACKEND_OWNER_ID,
+        clock=lambda: 100.0,
+    )
+    sessions = {}
+    for key in ("blocked-a1", "later-a2"):
+        sid = f"sid-{key}"
+        sessions[key] = (
+            sid,
+            {
+                "session_key": key,
+                "profile_home": str(hermes_home),
+                "history": [],
+                "history_lock": threading.Lock(),
+                "history_version": 0,
+                "running": False,
+                "attached_images": [],
+            },
+        )
+    launched = []
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    release = threading.Event()
+    monkeypatch.setattr(
+        server,
+        "_resume_goal_session_for_recovery",
+        lambda key, _home=None: sessions[key],
+    )
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_wait_agent", lambda *_args: None)
+    monkeypatch.setattr(server, "_start_goal_lease_heartbeat", lambda *_args: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: True)
+
+    def blocked_prompt(_rid, _sid, session, _prompt):
+        key = session["session_key"]
+        launched.append(key)
+        (first_entered if key == "blocked-a1" else second_entered).set()
+        assert release.wait(timeout=5)
+        with session["history_lock"]:
+            session["running"] = False
+
+    monkeypatch.setattr(server, "_run_prompt_submit", blocked_prompt)
+
+    result = server._recover_active_goals_once(coordinator)
+    assert result.accepted == 2
+    assert result.completed == 0
+    assert first_entered.wait(timeout=1)
+    assert second_entered.wait(timeout=1)
+    assert server._recover_active_goals_once(coordinator).accepted == 0
+    assert len(server._goal_recovery_turns) == 2
+
+    release.set()
+    assert server._drain_goal_recovery_turns(timeout=2.0) is True
+    assert server._goal_recovery_turns == {}
+    assert sorted(launched) == ["blocked-a1", "later-a2"]
+
+
+def test_more_than_four_blocked_profiles_do_not_starve_fifth_recovery_launch(
+    server, tmp_path, monkeypatch
+):
+    from hermes_cli.goal_execution import (
+        GoalExecutionRecord,
+        GoalRecoverySupervisor,
+        RecoveryScanResult,
+    )
+
+    launch = tmp_path / "launch"
+    profiles = tmp_path / "profiles"
+    launch.mkdir()
+    homes = [launch]
+    for index in range(5):
+        home = profiles / f"p{index}"
+        home.mkdir(parents=True)
+        (home / "state.db").touch()
+        homes.append(home)
+    release = threading.Event()
+    launched = {home.resolve(): threading.Event() for home in homes}
+    sessions = {}
+
+    class Coordinator:
+        def __init__(self, home):
+            self.home = Path(home).resolve()
+            self.sent = False
+        def bootstrap_reconcile_page(self):
+            return 0, True
+        def recover_once(self, dispatch):
+            if self.sent:
+                return RecoveryScanResult()
+            self.sent = True
+            record = GoalExecutionRecord(
+                session_id=self.home.name,
+                generation=1,
+                owner_id=server._GOAL_BACKEND_OWNER_ID,
+                claim_token=f"token-{self.home.name}",
+                lease_expires_at=999,
+                heartbeat_at=100,
+                next_run_at=0,
+                attempt=0,
+                last_error=None,
+            )
+            admission = dispatch(record, SimpleNamespace(goal=self.home.name))
+            return RecoveryScanResult(accepted=int(admission.accepted))
+        def close(self):
+            pass
+
+    def resume(key, home=None):
+        resolved = Path(home).resolve()
+        if resolved not in sessions:
+            sessions[resolved] = (
+                f"sid-{key}",
+                {
+                    "session_key": key,
+                    "profile_home": str(resolved),
+                    "history": [],
+                    "history_lock": threading.Lock(),
+                    "history_version": 0,
+                    "running": False,
+                    "attached_images": [],
+                },
+            )
+        return sessions[resolved]
+
+    monkeypatch.setattr(server, "_resume_goal_session_for_recovery", resume)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_wait_agent", lambda *_args: None)
+    monkeypatch.setattr(server, "_start_goal_lease_heartbeat", lambda *_args: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: True)
+
+    def block(_rid, _sid, session, _prompt):
+        launched[Path(session["profile_home"]).resolve()].set()
+        assert release.wait(timeout=5)
+        session["running"] = False
+
+    monkeypatch.setattr(server, "_run_prompt_submit", block)
+    supervisor = GoalRecoverySupervisor(
+        launch,
+        profiles_root=profiles,
+        coordinator_factory=Coordinator,
+        recover_callback=server._recover_active_goals_once,
+        recovery_workers=4,
+    )
+
+    assert supervisor.scan_once(wait=True) == 0
+    assert all(event.wait(timeout=1) for event in launched.values())
+    assert len(server._goal_recovery_turns) == 6
+    release.set()
+    assert server._drain_goal_recovery_turns(timeout=2.0) is True
+    assert supervisor.close(timeout=2.0) is True
+
+
+def test_recovery_capacity_reschedules_excess_then_later_admits_it(
+    server, hermes_home, monkeypatch
+):
+    from hermes_cli.goal_execution import GoalExecutionCoordinator
+    from hermes_cli.goals import GoalManager
+
+    keys = [f"bounded-{index}" for index in range(3)]
+    states = {key: GoalManager(key).set(key) for key in keys}
+    now = [100.0]
+    coordinator = GoalExecutionCoordinator(
+        hermes_home,
+        owner_id=server._GOAL_BACKEND_OWNER_ID,
+        clock=lambda: now[0],
+    )
+    sessions = {
+        key: (
+            f"sid-{key}",
+            {
+                "session_key": key,
+                "profile_home": str(hermes_home),
+                "history": [],
+                "history_lock": threading.Lock(),
+                "history_version": 0,
+                "running": False,
+                "attached_images": [],
+            },
+        )
+        for key in keys
+    }
+    entered = {key: threading.Event() for key in keys}
+    releases = {key: threading.Event() for key in keys}
+    monkeypatch.setattr(server, "_goal_recovery_max_concurrency", lambda: 2)
+    monkeypatch.setattr(
+        server,
+        "_resume_goal_session_for_recovery",
+        lambda key, _home=None: sessions[key],
+    )
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_wait_agent", lambda *_args: None)
+    monkeypatch.setattr(server, "_start_goal_lease_heartbeat", lambda *_args: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: True)
+
+    def blocked_prompt(_rid, _sid, restored, _prompt):
+        key = restored["session_key"]
+        entered[key].set()
+        assert releases[key].wait(timeout=5)
+        restored["running"] = False
+
+    monkeypatch.setattr(server, "_run_prompt_submit", blocked_prompt)
+
+    first = server._recover_active_goals_once(coordinator)
+    assert first.claimed == 3
+    assert first.accepted == 2
+    assert sum(event.wait(timeout=1) for event in entered.values()) == 2
+    deferred = next(key for key, event in entered.items() if not event.is_set())
+    deferred_lease = coordinator.get(deferred)
+    assert deferred_lease.generation == states[deferred].generation
+    assert deferred_lease.owner_id is None
+    assert deferred_lease.claim_token is None
+    assert deferred_lease.attempt == 0
+    assert deferred_lease.next_run_at == pytest.approx(101.0)
+
+    running = next(key for key, event in entered.items() if event.is_set())
+    releases[running].set()
+    deadline = time.monotonic() + 2
+    while len(server._goal_recovery_turns) == 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    now[0] = 101.0
+    second = server._recover_active_goals_once(coordinator)
+    assert second.accepted == 1
+    assert entered[deferred].wait(timeout=1)
+
+    for event in releases.values():
+        event.set()
+    assert server._drain_goal_recovery_turns(timeout=2.0) is True
+
+
+def test_recovery_cleanup_joins_exact_returned_turn_not_overwritten_user_turn(
+    server, hermes_home, monkeypatch
+):
+    from hermes_cli.goal_execution import GoalExecutionCoordinator
+    from hermes_cli.goals import GoalManager
+
+    session_key = "exact-turn-handle"
+    GoalManager(session_key).set("recover")
+    coordinator = GoalExecutionCoordinator(
+        hermes_home,
+        owner_id=server._GOAL_BACKEND_OWNER_ID,
+        clock=lambda: 100.0,
+    )
+    restored = {
+        "session_key": session_key,
+        "profile_home": str(hermes_home),
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+        "attached_images": [],
+    }
+    joined = []
+
+    class Handle:
+        def __init__(self, name):
+            self.name = name
+        def join(self, timeout=None):
+            joined.append((self.name, timeout))
+
+    recovered_handle = Handle("recovered")
+    user_handle = Handle("user")
+
+    def race_user_turn(_rid, _sid, session, _prompt):
+        session["running"] = False
+        session["_run_thread"] = user_handle
+        return recovered_handle
+
+    monkeypatch.setattr(
+        server,
+        "_resume_goal_session_for_recovery",
+        lambda *_args: ("sid-exact", restored),
+    )
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_wait_agent", lambda *_args: None)
+    monkeypatch.setattr(server, "_start_goal_lease_heartbeat", lambda *_args: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(server, "_run_prompt_submit", race_user_turn)
+
+    assert server._recover_active_goals_once(coordinator).accepted == 1
+    assert server._drain_goal_recovery_turns(timeout=2.0) is True
+    assert joined == [("recovered", None)]
+
+
+def test_shutdown_during_recovery_agent_build_interrupts_late_agent_without_prompt(
+    server, hermes_home, monkeypatch
+):
+    from hermes_cli.goal_execution import GoalExecutionCoordinator
+    from hermes_cli.goals import GoalManager
+
+    session_key = "late-agent-during-shutdown"
+    state = GoalManager(session_key).set("recover after restart")
+    dead = GoalExecutionCoordinator(hermes_home, owner_id="dead", clock=lambda: 1.0)
+    assert dead.claim(session_key, state.generation, lease_seconds=1.0) is not None
+    coordinator = GoalExecutionCoordinator(
+        hermes_home,
+        owner_id=server._GOAL_BACKEND_OWNER_ID,
+        clock=lambda: 100.0,
+    )
+    restored = {
+        "session_key": session_key,
+        "profile_home": str(hermes_home),
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+        "attached_images": [],
+        "agent": None,
+    }
+    wait_entered = threading.Event()
+    publish_agent = threading.Event()
+    interrupted = threading.Event()
+    heartbeat_stop = threading.Event()
+    prompts = []
+    shutdown_results = []
+
+    class LateAgent:
+        def interrupt(self):
+            interrupted.set()
+
+    def wait_agent(session, _rid):
+        with server._goal_recovery_turns_condition:
+            record = next(iter(server._goal_recovery_turns.values()))
+            assert record["session"] is session
+        wait_entered.set()
+        assert publish_agent.wait(timeout=5)
+        session["agent"] = LateAgent()
+        return None
+
+    def start_heartbeat(session, _generation):
+        session["_goal_lease_heartbeat_stop"] = heartbeat_stop
+
+    monkeypatch.setattr(server, "_goal_coordinators", {str(hermes_home): coordinator})
+    monkeypatch.setattr(server, "_goal_coordinator_inflight", {})
+    monkeypatch.setattr(server, "_goal_coordinator_closing", threading.Event())
+    monkeypatch.setattr(server, "_goal_recovery_supervisor", None)
+    monkeypatch.setattr(server, "_resume_goal_session_for_recovery", lambda *_args: ("sid-late-agent", restored))
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_wait_agent", wait_agent)
+    monkeypatch.setattr(server, "_start_goal_lease_heartbeat", start_heartbeat)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *_args: prompts.append(True))
+    monkeypatch.setattr(server, "_shutdown_sessions", lambda: None)
+
+    assert server._recover_active_goals_once(coordinator).accepted == 1
+    assert wait_entered.wait(timeout=1)
+
+    shutdown = threading.Thread(
+        target=lambda: shutdown_results.append(server._shutdown_goal_runtime())
+    )
+    shutdown.start()
+    try:
+        assert heartbeat_stop.wait(timeout=1)
+        assert shutdown.is_alive()
+        publish_agent.set()
+        shutdown.join(timeout=5)
+    finally:
+        publish_agent.set()
+        shutdown.join(timeout=5)
+
+    assert not shutdown.is_alive()
+    assert shutdown_results == [True]
+    assert prompts == []
+    assert interrupted.wait(timeout=1)
+    assert restored["running"] is False
+    lease = GoalExecutionCoordinator(hermes_home, owner_id="observer").get(session_key)
+    assert lease is not None
+    assert lease.generation == state.generation
+    assert lease.owner_id is None
+    assert lease.claim_token is None
+    assert lease.attempt == 0
+    assert "shutdown" in str(lease.last_error).lower()
+
+
+def test_profile_swap_during_agent_wait_interrupts_agent_and_releases_exact_claim(
+    server, hermes_home, monkeypatch
+):
+    from hermes_cli.goal_execution import GoalExecutionCoordinator
+    from hermes_cli.goals import GoalManager
+
+    session_key = "profile-swap-during-agent-wait"
+    state = GoalManager(session_key).set("recover after restart")
+    coordinator = GoalExecutionCoordinator(
+        hermes_home,
+        owner_id=server._GOAL_BACKEND_OWNER_ID,
+        clock=lambda: 100.0,
+    )
+    restored = {
+        "session_key": session_key,
+        "profile_home": str(hermes_home),
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+        "attached_images": [],
+    }
+    pinned_home = hermes_home.with_name(".hermes-pinned")
+    interrupted = threading.Event()
+    prompts = []
+
+    class LateAgent:
+        def interrupt(self):
+            interrupted.set()
+
+    def swap_profile_during_wait(session, _rid):
+        hermes_home.rename(pinned_home)
+        hermes_home.mkdir()
+        (hermes_home / "state.db").touch()
+        session["agent"] = LateAgent()
+        return None
+
+    monkeypatch.setattr(
+        server,
+        "_resume_goal_session_for_recovery",
+        lambda *_args: ("sid-profile-swap", restored),
+    )
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_wait_agent", swap_profile_during_wait)
+    monkeypatch.setattr(server, "_start_goal_lease_heartbeat", lambda *_args: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *_args: prompts.append(True))
+
+    try:
+        result = server._recover_active_goals_once(coordinator)
+        assert result.accepted == 1
+        with pytest.raises(RuntimeError, match="identity changed"):
+            result.completions[0].result(timeout=2)
+        assert server._drain_goal_recovery_turns(timeout=2.0) is True
+        assert prompts == []
+        assert interrupted.wait(timeout=1)
+        lease = coordinator.get(session_key)
+        assert lease is not None
+        assert lease.generation == state.generation
+        assert lease.owner_id is None
+        assert lease.claim_token is None
+        assert lease.attempt == 1
+    finally:
+        coordinator.close()
+        if hermes_home.exists() and pinned_home.exists():
+            (hermes_home / "state.db").unlink(missing_ok=True)
+            hermes_home.rmdir()
+            pinned_home.rename(hermes_home)
+
+
+def test_shutdown_interrupts_exact_recovery_agents_and_daemon_worker_cannot_hang_exit(
+    server, monkeypatch
+):
+    released = threading.Event()
+    interrupted = threading.Event()
+    bound = threading.Event()
+    session = {"agent": SimpleNamespace(interrupt=lambda: (interrupted.set(), released.set()))}
+    key = ("/profile", "cancel-me", 1, "token")
+
+    def target():
+        assert server._bind_goal_recovery_turn_session(key, session)
+        bound.set()
+        released.wait(timeout=5)
+
+    assert server._start_tracked_goal_recovery_turn(key, target) is True
+    with server._goal_recovery_turns_condition:
+        worker = server._goal_recovery_turns[key]["thread"]
+    assert worker.daemon is True
+    assert bound.wait(timeout=1)
+
+    server._cancel_goal_recovery_turns()
+    assert interrupted.wait(timeout=1)
+    assert server._drain_goal_recovery_turns(timeout=1.0) is True
+
+
+def test_duplicate_exact_recovery_turn_is_rejected_without_consuming_capacity(
+    server, monkeypatch
+):
+    release = threading.Event()
+    started = threading.Event()
+    key = ("/profile", "duplicate", 1, "token")
+    monkeypatch.setattr(server, "_goal_recovery_max_concurrency", lambda: 2)
+
+    assert server._start_tracked_goal_recovery_turn(
+        key, lambda: (started.set(), release.wait(timeout=5))
+    ) is True
+    assert started.wait(timeout=1)
+    assert server._start_tracked_goal_recovery_turn(key, lambda: None) is False
+    assert len(server._goal_recovery_turns) == 1
+
+    release.set()
+    assert server._drain_goal_recovery_turns(timeout=1.0) is True
+
+
+def test_recovery_identity_failure_before_resume_is_durably_scheduled_and_reported(
+    server, monkeypatch
+):
+    from hermes_cli.goal_execution import GoalExecutionRecord
+
+    scheduled = []
+    resumed = []
+    record = GoalExecutionRecord(
+        session_id="swapped-profile",
+        generation=3,
+        owner_id=server._GOAL_BACKEND_OWNER_ID,
+        claim_token="exact-token",
+        lease_expires_at=999,
+        heartbeat_at=100,
+        next_run_at=0,
+        attempt=0,
+        last_error=None,
+    )
+
+    class Coordinator:
+        home = Path("/profile")
+
+        def validate_profile_identity(self):
+            raise RuntimeError("goal profile identity changed")
+
+        def recover_once(self, dispatch):
+            admission = dispatch(record, SimpleNamespace(goal="do not resume"))
+            from hermes_cli.goal_execution import RecoveryScanResult
+
+            return RecoveryScanResult(
+                claimed=1,
+                accepted=int(admission.accepted),
+                completions=(admission.completion,),
+            )
+
+        def schedule(self, *args, **kwargs):
+            scheduled.append((args, kwargs))
+            return True
+
+    monkeypatch.setattr(
+        server,
+        "_resume_goal_session_for_recovery",
+        lambda *_args, **_kwargs: resumed.append(True),
+    )
+    result = server._recover_active_goals_once(Coordinator())
+    assert result.accepted == 1
+    assert len(result.completions) == 1
+    with pytest.raises(RuntimeError, match="identity changed"):
+        result.completions[0].result(timeout=1)
+    assert server._drain_goal_recovery_turns(timeout=1.0) is True
+    assert resumed == []
+    assert scheduled
+    assert scheduled[0][0][:3] == ("swapped-profile", 3, "exact-token")
+    assert scheduled[0][1]["increment_attempt"] is True
+
+
+def test_goal_runtime_shutdown_times_out_with_gate_closed_before_blocked_turn_drains(
+    server, monkeypatch
+):
+    release = threading.Event()
+    started = threading.Event()
+    sessions_snapshotted = []
+    closing = threading.Event()
+    monkeypatch.setattr(server, "_goal_coordinator_closing", closing)
+    monkeypatch.setattr(server, "_goal_recovery_supervisor", None)
+    monkeypatch.setattr(server, "_GOAL_COORDINATOR_SHUTDOWN_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(server, "_shutdown_sessions", lambda: sessions_snapshotted.append(True))
+
+    key = ("/profile", "blocked", 1, "token")
+    assert server._start_tracked_goal_recovery_turn(
+        key,
+        lambda: (started.set(), release.wait(timeout=5)),
+    )
+    assert started.wait(timeout=1)
+
+    assert server._shutdown_goal_runtime() is False
+    assert closing.is_set()
+    assert sessions_snapshotted == []
+    assert server._start_tracked_goal_recovery_turn(("/profile", "late", 1, "x"), lambda: None) is False
+
+    release.set()
+    assert server._drain_goal_recovery_turns(timeout=2.0) is True
 
 
 def test_goal_inline_contract_preserves_exact_draft_boundaries(server, session):
@@ -1634,6 +2367,178 @@ def test_goal_draft_command_dispatch_is_offloaded_from_rpc_reader(
         release.set()
 
     assert transport.written[0]["result"]["message"] == "Ship the staging slice"
+
+
+@pytest.mark.parametrize(
+    ("command", "method_name"),
+    [("pause", "pause"), ("clear", "clear"), ("done", "clear")],
+)
+def test_stale_goal_control_command_reports_conflict_and_preserves_newer_winner(
+    server, session, monkeypatch, command, method_name
+):
+    from hermes_cli.goals import GoalManager
+
+    sid, session_key, _ = session
+    GoalManager(session_key).set("old goal")
+    original = getattr(GoalManager, method_name)
+    raced = False
+    invalidated = []
+
+    def lose_to_newer_set(self, *args, **kwargs):
+        nonlocal raced
+        if not raced:
+            raced = True
+            GoalManager(session_key).set("new winner")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(GoalManager, method_name, lose_to_newer_set)
+    monkeypatch.setattr(
+        server,
+        "_invalidate_goal_execution",
+        lambda *args, **kwargs: invalidated.append((args, kwargs)),
+    )
+
+    response = _call(
+        server, "command.dispatch", name="goal", arg=command, session_id=sid
+    )
+
+    assert "changed" in response["result"]["output"].lower()
+    durable = GoalManager(session_key).state
+    assert durable.goal == "new winner"
+    assert durable.status == "active"
+    assert invalidated == []
+
+
+@pytest.mark.parametrize("command", ["clear", "done", "stop"])
+def test_failed_clear_alias_cannot_replay_override_over_newer_goal_and_lease(
+    server, session, monkeypatch, command
+):
+    from hermes_cli.goals import GoalManager
+
+    sid, session_key, s = session
+    GoalManager(session_key).set("old goal")
+    stale_activation = server._new_pending_goal_activation(s, {"goal": "drafted goal"})
+    activation_generation = s["_goal_activation_generation"]
+    evaluator_entered = threading.Event()
+    release_evaluator = threading.Event()
+    evaluator_results = []
+
+    def blocked_evaluation(self, *_args, **_kwargs):
+        evaluator_entered.set()
+        assert release_evaluator.wait(timeout=5)
+        return {
+            "status": "active",
+            "should_continue": True,
+            "continuation_prompt": "continue old goal",
+            "verdict": "continue",
+            "reason": "stale evaluation completed",
+            "message": "",
+        }
+
+    monkeypatch.setattr(GoalManager, "evaluate_after_turn", blocked_evaluation)
+    evaluator = threading.Thread(
+        target=lambda: evaluator_results.append(
+            server._evaluate_goal_turn(s, "stale progress", [])
+        )
+    )
+    evaluator.start()
+    assert evaluator_entered.wait(timeout=5)
+
+    coordinator = server._goal_execution_coordinator(s)
+    original_clear = GoalManager.clear
+    winner = {}
+
+    def lose_clear_cas_to_newer_winner(self):
+        if not winner:
+            newer_state = GoalManager(session_key).set("newer winner")
+            newer_lease = coordinator.claim(session_key, newer_state.generation)
+            assert newer_lease is not None
+            winner.update(state=newer_state, lease=newer_lease)
+        return original_clear(self)
+
+    monkeypatch.setattr(GoalManager, "clear", lose_clear_cas_to_newer_winner)
+
+    response = _call(
+        server, "command.dispatch", name="goal", arg=command, session_id=sid
+    )
+
+    assert "changed" in response["result"]["output"].lower()
+    assert "no change" in response["result"]["output"].lower()
+    assert s["_goal_activation_generation"] == activation_generation + 1
+    assert "pending_goal_activation" not in s
+    assert not server._goal_activation_is_current(s, stale_activation)
+    assert "_goal_control_override" not in s
+    assert "_goal_control_override_token" not in s
+
+    release_evaluator.set()
+    evaluator.join(timeout=5)
+
+    assert not evaluator.is_alive()
+    assert len(evaluator_results) == 1
+    durable = GoalManager(session_key).state
+    assert durable is not None
+    assert durable.goal == winner["state"].goal
+    assert durable.generation == winner["state"].generation
+    assert durable.status == "active"
+    assert coordinator.get(session_key) == winner["lease"]
+
+
+@pytest.mark.parametrize("command", ["clear", "done", "stop"])
+def test_successful_clear_alias_reconciles_one_stale_evaluator_write_once(
+    server, session, monkeypatch, command
+):
+    from hermes_cli.goals import GoalManager
+
+    sid, session_key, s = session
+    GoalManager(session_key).set("old goal")
+    evaluator_entered = threading.Event()
+    release_evaluator = threading.Event()
+    evaluator_results = []
+
+    def stale_evaluation(self, *_args, **_kwargs):
+        evaluator_entered.set()
+        assert release_evaluator.wait(timeout=5)
+        self.set("stale evaluator rewrite")
+        return {
+            "status": "active",
+            "should_continue": True,
+            "continuation_prompt": "continue stale rewrite",
+            "verdict": "continue",
+            "reason": "stale evaluator write",
+            "message": "",
+        }
+
+    monkeypatch.setattr(GoalManager, "evaluate_after_turn", stale_evaluation)
+    original_clear = GoalManager.clear
+    cleared_goals = []
+
+    def counted_clear(self):
+        cleared_goals.append(self.state.goal if self.state is not None else None)
+        return original_clear(self)
+
+    monkeypatch.setattr(GoalManager, "clear", counted_clear)
+    evaluator = threading.Thread(
+        target=lambda: evaluator_results.append(
+            server._evaluate_goal_turn(s, "stale progress", [])
+        )
+    )
+    evaluator.start()
+    assert evaluator_entered.wait(timeout=5)
+
+    response = _call(
+        server, "command.dispatch", name="goal", arg=command, session_id=sid
+    )
+    assert response["result"]["output"] == "✓ Goal cleared."
+
+    release_evaluator.set()
+    evaluator.join(timeout=5)
+
+    assert not evaluator.is_alive()
+    assert evaluator_results[0]["status"] == "cleared"
+    assert cleared_goals == ["old goal", "stale evaluator rewrite"]
+    durable = GoalManager(session_key).state
+    assert durable is not None
+    assert durable.status == "cleared"
 
 
 def test_goal_pause_after_accepted_set(server, session, monkeypatch):

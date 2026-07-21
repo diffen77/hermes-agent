@@ -5,6 +5,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+
+def test_default_goal_recovery_concurrency_is_canonical():
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["goals"]["recovery_max_concurrency"] == 8
 import yaml
 
 from hermes_cli.config import (

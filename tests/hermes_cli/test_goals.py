@@ -275,6 +275,46 @@ class TestGoalManager:
         assert mgr.state is None
         assert not mgr.is_active()
 
+    def test_clear_and_mark_done_return_only_committed_transitions(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        cleared_manager = GoalManager("truthful-clear")
+        cleared_manager.set("clear me")
+        cleared = cleared_manager.clear()
+        assert cleared is not None
+        assert cleared.status == "cleared"
+        assert GoalManager("truthful-clear").state.status == "cleared"
+
+        done_manager = GoalManager("truthful-done")
+        done_manager.set("finish me")
+        done = done_manager.mark_done("verified")
+        assert done is not None
+        assert done.status == "done"
+        assert GoalManager("truthful-done").state.status == "done"
+
+    @pytest.mark.parametrize("operation", ["pause", "clear", "done"])
+    def test_stale_control_transition_reloads_newer_set_and_reports_conflict(
+        self, hermes_home, operation
+    ):
+        from hermes_cli.goals import GoalManager, GoalStateConflict
+
+        owner = GoalManager(f"stale-{operation}")
+        owner.set("old")
+        stale = GoalManager(f"stale-{operation}")
+        winner = GoalManager(f"stale-{operation}").set("new")
+
+        with pytest.raises(GoalStateConflict):
+            if operation == "pause":
+                stale.pause("stale pause")
+            elif operation == "clear":
+                stale.clear()
+            else:
+                stale.mark_done("stale done")
+
+        assert stale.state.to_json() == winner.to_json()
+        durable = GoalManager(f"stale-{operation}").state
+        assert durable.to_json() == winner.to_json()
+
     def test_persistence_across_managers(self, hermes_home):
         """Key invariant: a second manager on the same session sees the goal.
 
@@ -290,6 +330,272 @@ class TestGoalManager:
         assert mgr2.state is not None
         assert mgr2.state.goal == "do the thing"
         assert mgr2.is_active()
+
+    def test_manager_remains_pinned_to_construction_profile_after_scope_switch(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        home_a = (tmp_path / "profile-a").resolve()
+        home_b = (tmp_path / "profile-b").resolve()
+        home_a.mkdir()
+        home_b.mkdir()
+        current = {"home": home_a}
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: current["home"])
+        goals._clear_db_cache(close=True)
+
+        manager_a = GoalManager("same-session")
+        manager_a.set("profile A goal")
+        current["home"] = home_b
+        manager_a.add_subgoal("still belongs to A")
+
+        manager_b = GoalManager("same-session")
+        assert manager_b.state is None
+        manager_b.set("profile B goal")
+
+        current["home"] = home_a
+        durable_a = GoalManager("same-session").state
+        current["home"] = home_b
+        durable_b = GoalManager("same-session").state
+        assert durable_a.goal == "profile A goal"
+        assert durable_a.subgoals == ["still belongs to A"]
+        assert durable_b.goal == "profile B goal"
+        assert durable_b.subgoals == []
+
+    def test_concurrent_set_allocates_unique_increasing_generations_and_due_lease(
+        self, hermes_home
+    ):
+        from hermes_cli.goals import GoalManager
+        from hermes_state import SessionDB
+
+        managers = [GoalManager("concurrent-set") for _ in range(2)]
+        ready = threading.Barrier(3)
+        states = []
+
+        def set_goal(manager, text):
+            ready.wait(timeout=5)
+            states.append(manager.set(text))
+
+        threads = [
+            threading.Thread(target=set_goal, args=(manager, f"goal-{index}"))
+            for index, manager in enumerate(managers)
+        ]
+        for thread in threads:
+            thread.start()
+        ready.wait(timeout=5)
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert sorted(state.generation for state in states) == [1, 2]
+        current = GoalManager("concurrent-set").state
+        assert current.generation == 2
+        observer = SessionDB(hermes_home / "state.db")
+        try:
+            lease = observer.get_goal_execution_lease("concurrent-set")
+            assert lease["generation"] == 2
+            assert lease["owner_id"] is None
+            assert lease["next_run_at"] > 0
+        finally:
+            observer.close()
+
+    def test_blocked_stale_judge_cannot_overwrite_concurrent_pause(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        stale = GoalManager("stale-judge")
+        stale.set("original")
+        judge_entered = threading.Event()
+        release_judge = threading.Event()
+        decision = {}
+
+        def blocked_judge(*_args, **_kwargs):
+            judge_entered.set()
+            assert release_judge.wait(timeout=5)
+            return "done", "stale completion", False, None
+
+        def evaluate():
+            decision.update(stale.evaluate_after_turn("old result"))
+
+        with patch.object(goals, "judge_goal", side_effect=blocked_judge):
+            worker = threading.Thread(target=evaluate)
+            worker.start()
+            assert judge_entered.wait(timeout=5)
+            winner = GoalManager("stale-judge").pause("user-paused")
+            release_judge.set()
+            worker.join(timeout=5)
+
+        assert not worker.is_alive()
+        assert winner.status == "paused"
+        persisted = GoalManager("stale-judge").state
+        assert persisted.status == "paused"
+        assert persisted.generation == winner.generation
+        assert decision["verdict"] == "stale"
+
+    def test_judge_wait_is_committed_by_claim_owner_in_one_cas(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goal_execution import GoalExecutionCoordinator
+        from hermes_cli.goals import GoalManager
+
+        manager = GoalManager("claimed-wait")
+        initial = manager.set("wait for CI")
+        owner = GoalExecutionCoordinator(hermes_home, owner_id="judge-owner")
+        claim = owner.claim("claimed-wait", initial.generation)
+        assert claim is not None
+
+        with patch.object(
+            goals,
+            "judge_goal",
+            return_value=("wait", "CI still running", False, {"seconds": 30}),
+        ):
+            decision = manager.evaluate_after_turn(
+                "CI started",
+                persistence_guard=lambda: True,
+                persistence_owner_id="judge-owner",
+                persistence_claim_token=claim.claim_token,
+            )
+
+        durable = GoalManager("claimed-wait").state
+        assert decision["verdict"] == "wait"
+        assert durable.turns_used == 1
+        assert durable.last_verdict == "wait"
+        assert durable.last_reason == "CI still running"
+        assert durable.waiting_until > time.time()
+        assert manager.state.to_json() == durable.to_json()
+        owner.close()
+
+    def test_judge_wait_token_loss_reloads_durable_state_and_never_reports_success(
+        self, hermes_home
+    ):
+        from hermes_cli import goals
+        from hermes_cli.goal_execution import GoalExecutionCoordinator
+        from hermes_cli.goals import GoalManager
+
+        manager = GoalManager("lost-wait-claim")
+        initial = manager.set("wait safely")
+        owner = GoalExecutionCoordinator(hermes_home, owner_id="judge-owner")
+        claim = owner.claim("lost-wait-claim", initial.generation)
+        assert claim is not None
+
+        with patch.object(
+            goals,
+            "judge_goal",
+            return_value=("wait", "blocked", False, {"seconds": 30}),
+        ):
+            decision = manager.evaluate_after_turn(
+                "started",
+                persistence_guard=lambda: True,
+                persistence_owner_id="judge-owner",
+                persistence_claim_token="wrong-token",
+            )
+
+        durable = GoalManager("lost-wait-claim").state
+        assert decision["verdict"] in {"stale", "lease_lost"}
+        assert durable.turns_used == 0
+        assert durable.last_verdict is None
+        assert durable.waiting_until == 0.0
+        assert manager.state.to_json() == durable.to_json()
+        owner.close()
+
+
+    def test_db_cache_is_per_home_single_flight_and_failed_construction_retries(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import goals
+
+        home = tmp_path / "cache-home"
+        home.mkdir()
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: home)
+        real_db = __import__("hermes_state").SessionDB
+        entered = threading.Event()
+        release = threading.Event()
+        attempts = 0
+        instances = []
+
+        def constructor(path):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("retry me")
+            entered.set()
+            assert release.wait(timeout=5)
+            db = real_db(path)
+            instances.append(db)
+            return db
+
+        goals._clear_db_cache(close=True)
+        monkeypatch.setattr("hermes_state.SessionDB", constructor)
+        assert goals._get_session_db() is None
+        results = []
+        threads = [
+            threading.Thread(target=lambda: results.append(goals._get_session_db()))
+            for _ in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        assert entered.wait(timeout=5)
+        release.set()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert attempts == 2
+        assert len(instances) == 1
+        assert results == [instances[0], instances[0]]
+        goals._clear_db_cache(close=True)
+        assert instances[0]._conn is None
+
+    def test_close_cache_waits_for_inflight_constructor_and_rejects_late_publish(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import goals
+
+        home = (tmp_path / "close-race").resolve()
+        home.mkdir()
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: home)
+        real_db = __import__("hermes_state").SessionDB
+        entered = threading.Event()
+        release = threading.Event()
+        constructed = []
+
+        def blocked_constructor(path):
+            db = real_db(path)
+            constructed.append(db)
+            entered.set()
+            assert release.wait(timeout=5)
+            return db
+
+        goals._clear_db_cache(close=True)
+        monkeypatch.setattr("hermes_state.SessionDB", blocked_constructor)
+        acquired = []
+        getter = threading.Thread(target=lambda: acquired.append(goals._get_session_db()))
+        getter.start()
+        assert entered.wait(timeout=5)
+
+        cleared = threading.Event()
+
+        def clear_cache():
+            goals._clear_db_cache(close=True)
+            cleared.set()
+
+        closer = threading.Thread(target=clear_cache)
+        closer.start()
+        assert not cleared.wait(timeout=0.1)
+        release.set()
+        getter.join(timeout=5)
+        closer.join(timeout=5)
+
+        assert not getter.is_alive()
+        assert not closer.is_alive()
+        assert acquired == [None]
+        assert constructed[0]._conn is None
+        assert goals._DB_CACHE == {}
+
+        monkeypatch.setattr("hermes_state.SessionDB", real_db)
+        reopened = goals._get_session_db()
+        assert reopened is not None
+        assert reopened is not constructed[0]
+        goals._clear_db_cache(close=True)
 
     def test_evaluate_after_turn_done(self, hermes_home):
         """Judge says done → status=done, no continuation."""
@@ -307,6 +613,32 @@ class TestGoalManager:
         assert decision["continuation_prompt"] is None
         assert mgr.state.status == "done"
         assert mgr.state.turns_used == 1
+
+    def test_claimed_empty_turn_token_loss_reloads_durable_state_and_suppresses_continuation(
+        self, hermes_home
+    ):
+        from hermes_cli.goal_execution import GoalExecutionCoordinator
+        from hermes_cli.goals import GoalManager
+
+        manager = GoalManager("lost-empty-claim", default_max_turns=5)
+        initial = manager.set("persist empty turns safely")
+        owner = GoalExecutionCoordinator(hermes_home, owner_id="backend-owner")
+        claim = owner.claim("lost-empty-claim", initial.generation)
+        assert claim is not None
+
+        decision = manager.record_empty_turn(
+            persistence_guard=lambda: True,
+            persistence_owner_id="backend-owner",
+            persistence_claim_token="wrong-token",
+        )
+
+        durable = GoalManager("lost-empty-claim").state
+        assert decision["verdict"] in {"stale", "lease_lost"}
+        assert decision["should_continue"] is False
+        assert durable.turns_used == 0
+        assert durable.last_verdict is None
+        assert manager.state.to_json() == durable.to_json()
+        owner.close()
 
     def test_evaluate_after_turn_continue_under_budget(self, hermes_home):
         from hermes_cli import goals
@@ -620,6 +952,40 @@ class TestMigrateGoalToSession:
         assert migrate_goal_to_session("p4", "c4") is False
         assert load_goal("c4") is None
 
+    def test_migration_fault_rolls_back_and_uses_explicit_profile_db(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalState, load_goal, migrate_goal_to_session, save_goal
+
+        home_a = (tmp_path / "migration-a").resolve()
+        home_b = (tmp_path / "migration-b").resolve()
+        home_a.mkdir()
+        home_b.mkdir()
+        current = {"home": home_a}
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: current["home"])
+        goals._clear_db_cache(close=True)
+        db_a = goals._get_session_db(home_a)
+        assert db_a is not None
+        assert save_goal("fault-parent", GoalState(goal="atomic"), home=home_a, db=db_a)
+        db_a._conn.execute(
+            """CREATE TRIGGER fail_goal_archive BEFORE UPDATE ON state_meta
+               WHEN OLD.key = 'goal:fault-parent'
+               BEGIN SELECT RAISE(ABORT, 'fault injection'); END"""
+        )
+        db_a._conn.commit()
+
+        current["home"] = home_b
+        assert migrate_goal_to_session(
+            "fault-parent", "fault-child", home=home_a, db=db_a
+        ) is False
+
+        parent = load_goal("fault-parent", home=home_a, db=db_a)
+        child = load_goal("fault-child", home=home_a, db=db_a)
+        assert parent is not None and parent.status == "active"
+        assert child is None
+        assert load_goal("fault-child", home=home_b) is None
+
 
 class TestGoalManagerSubgoals:
     def test_add_subgoal(self, hermes_home):
@@ -629,6 +995,39 @@ class TestGoalManagerSubgoals:
         text = mgr.add_subgoal("  use bullet points  ")
         assert text == "use bullet points"
         assert mgr.state.subgoals == ["use bullet points"]
+
+    def test_stale_subgoal_cannot_overwrite_concurrent_pause(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        stale = GoalManager("subgoal-vs-pause")
+        stale.set("main")
+        stale = GoalManager("subgoal-vs-pause")
+        winner = GoalManager("subgoal-vs-pause")
+        paused = winner.pause("control won")
+
+        with pytest.raises(RuntimeError, match="changed|persist"):
+            stale.add_subgoal("stale criterion")
+
+        durable = GoalManager("subgoal-vs-pause").state
+        assert paused is not None
+        assert durable.status == "paused"
+        assert durable.subgoals == []
+        assert stale.state.to_json() == durable.to_json()
+
+    def test_subgoal_disk_write_failure_is_not_reported_as_success(
+        self, hermes_home, monkeypatch
+    ):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        manager = GoalManager("subgoal-write-failure")
+        manager.set("main")
+        monkeypatch.setattr(goals, "save_goal", lambda *_args, **_kwargs: False)
+
+        with pytest.raises(RuntimeError, match="changed|persist"):
+            manager.add_subgoal("must not leak")
+
+        assert manager.state.subgoals == []
 
     def test_add_subgoal_requires_active_goal(self, hermes_home):
         import pytest

@@ -1,11 +1,41 @@
 from __future__ import annotations
 
-import importlib
+import os
 import sqlite3
+import subprocess
+import sys
+import textwrap
 import threading
 from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def close_test_supervisors(monkeypatch):
+    """Every test deterministically drains executors before interpreter exit."""
+    from hermes_cli import goal_execution
+
+    supervisor_type = goal_execution.GoalRecoverySupervisor
+    supervisors = []
+
+    def tracked_supervisor(*args, **kwargs):
+        supervisor = supervisor_type(*args, **kwargs)
+        supervisors.append(supervisor)
+        return supervisor
+
+    monkeypatch.setattr(goal_execution, "GoalRecoverySupervisor", tracked_supervisor)
+    yield
+    closed = set()
+    for supervisor in reversed(supervisors):
+        identity = id(supervisor)
+        if identity in closed:
+            continue
+        closed.add(identity)
+        close = getattr(supervisor, "close", None)
+        if not callable(close) or getattr(supervisor, "_closed", False):
+            continue
+        close(timeout=1.0)
 
 
 @pytest.fixture()
@@ -41,6 +71,12 @@ class _FakeThread:
 
     def is_alive(self):
         return self.started and not self.joined
+
+
+def _remove_goal_execution_leases_for_legacy_fixture(hermes_home):
+    """Model pre-B1b3 active state_meta rows, which had no lease rows."""
+    with sqlite3.connect(hermes_home / "state.db") as conn:
+        conn.execute("DELETE FROM goal_execution_leases")
 
 
 def test_profile_discovery_is_home_anchored_and_state_db_bounded(tmp_path):
@@ -84,6 +120,205 @@ def test_profile_discovery_defaults_to_canonical_root_and_rejects_escapes(
     monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda: root)
 
     assert discover_goal_profile_homes(launch) == [launch.resolve(), valid.resolve()]
+
+
+def test_profile_discovery_rejects_state_db_symlink_to_sibling_profile(tmp_path):
+    from hermes_cli.goal_execution import discover_goal_profile_homes
+
+    launch = tmp_path / "launch"
+    profiles = tmp_path / "profiles"
+    victim = profiles / "victim"
+    linked = profiles / "linked"
+    launch.mkdir()
+    victim.mkdir(parents=True)
+    linked.mkdir()
+    (victim / "state.db").touch()
+    (linked / "state.db").symlink_to(victim / "state.db")
+
+    assert discover_goal_profile_homes(launch, profiles_root=profiles) == [
+        launch.resolve(),
+        victim.resolve(),
+    ]
+
+
+def test_profile_discovery_rejects_hardlinked_databases_and_unsafe_launch_home(tmp_path):
+    from hermes_cli.goal_execution import discover_goal_profile_homes
+
+    launch = tmp_path / "launch"
+    profiles = tmp_path / "profiles"
+    victim = profiles / "victim"
+    linked = profiles / "linked"
+    launch.mkdir()
+    victim.mkdir(parents=True)
+    linked.mkdir()
+    (victim / "state.db").touch()
+    os.link(victim / "state.db", linked / "state.db")
+
+    # Both names are unsafe once the inode has multiple links.
+    assert discover_goal_profile_homes(launch, profiles_root=profiles) == [launch.resolve()]
+
+    os.link(victim / "state.db", launch / "state.db")
+    with pytest.raises(RuntimeError, match="hardlink"):
+        discover_goal_profile_homes(launch, profiles_root=profiles)
+
+
+def test_launch_profile_directory_symlink_is_rejected(tmp_path):
+    from hermes_cli.goal_execution import GoalRecoverySupervisor
+
+    real = tmp_path / "real"
+    linked = tmp_path / "linked"
+    real.mkdir()
+    (real / "state.db").touch()
+    linked.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="profile directory"):
+        GoalRecoverySupervisor(linked)
+
+
+def test_profile_db_is_revalidated_after_coordinator_open(tmp_path):
+    from hermes_cli.goal_execution import GoalRecoverySupervisor
+
+    launch = tmp_path / "launch"
+    profiles = tmp_path / "profiles"
+    victim = profiles / "victim"
+    raced = profiles / "raced"
+    launch.mkdir()
+    victim.mkdir(parents=True)
+    raced.mkdir()
+    (victim / "state.db").touch()
+    raced_db = raced / "state.db"
+    raced_db.touch()
+    recovered = []
+
+    class Coordinator:
+        def __init__(self, home):
+            self.home = Path(home)
+            self.closed = False
+            if self.home == raced.resolve():
+                raced_db.unlink()
+                raced_db.symlink_to(victim / "state.db")
+        def bootstrap_reconcile(self):
+            recovered.append(self.home)
+        def recover_once(self, _dispatch):
+            recovered.append(self.home)
+            return 1
+        def close(self):
+            self.closed = True
+
+    supervisor = GoalRecoverySupervisor(
+        launch,
+        profiles_root=profiles,
+        coordinator_factory=Coordinator,
+    )
+
+    assert supervisor.scan_once() == 2
+    assert raced.resolve() not in recovered
+    assert raced.resolve() in supervisor.profile_errors
+
+
+def test_open_coordinator_identity_is_pinned_across_later_scans(tmp_path):
+    from hermes_cli.goal_execution import GoalRecoverySupervisor
+
+    launch = tmp_path / "launch"
+    profile = tmp_path / "profiles" / "work"
+    launch.mkdir(parents=True)
+    profile.mkdir(parents=True)
+    (profile / "state.db").touch()
+    calls = []
+
+    class Coordinator:
+        def __init__(self, home):
+            self.home = Path(home)
+        def bootstrap_reconcile_page(self):
+            return 0, True
+        def recover_once(self, _dispatch):
+            calls.append(self.home)
+            return 0
+        def close(self):
+            pass
+
+    supervisor = GoalRecoverySupervisor(
+        launch,
+        profiles_root=tmp_path / "profiles",
+        coordinator_factory=Coordinator,
+    )
+    assert supervisor.scan_once() == 0
+    original_calls = list(calls)
+
+    old_profile = profile.with_name("work-old")
+    profile.rename(old_profile)
+    profile.mkdir()
+    (profile / "state.db").touch()
+
+    assert supervisor.scan_once() == 0
+    assert calls == original_calls + [launch.resolve()]
+    assert profile.resolve() in supervisor.profile_errors
+    assert "identity" in str(supervisor.profile_errors[profile.resolve()])
+
+
+def test_recovery_releases_old_claim_when_database_is_replaced_before_dispatch(
+    hermes_home, monkeypatch
+):
+    from hermes_cli.goal_execution import GoalExecutionCoordinator
+    from hermes_cli.goals import GoalManager
+
+    state = GoalManager("identity-race").set("must not run in replacement")
+    coordinator = GoalExecutionCoordinator(
+        hermes_home, owner_id="old-db", clock=lambda: 100.0
+    )
+    original_claim = coordinator.claim
+
+    def claim_then_replace(*args, **kwargs):
+        record = original_claim(*args, **kwargs)
+        old_path = hermes_home / "state-old.db"
+        (hermes_home / "state.db").rename(old_path)
+        (hermes_home / "state.db").touch()
+        return record
+
+    monkeypatch.setattr(coordinator, "claim", claim_then_replace)
+    dispatched = []
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        coordinator.recover_once(lambda *_args: dispatched.append(True))
+
+    assert dispatched == []
+    old_lease = coordinator.get("identity-race")
+    assert old_lease is not None
+    assert old_lease.generation == state.generation
+    assert old_lease.owner_id is None
+    assert old_lease.claim_token is None
+    assert "identity" in str(old_lease.last_error).lower()
+
+
+def test_recovery_releases_old_claim_when_profile_directory_is_replaced(
+    hermes_home, monkeypatch
+):
+    from hermes_cli.goal_execution import GoalExecutionCoordinator
+    from hermes_cli.goals import GoalManager
+
+    GoalManager("directory-race").set("must remain on the old inode")
+    coordinator = GoalExecutionCoordinator(
+        hermes_home, owner_id="old-directory", clock=lambda: 100.0
+    )
+    original_claim = coordinator.claim
+    old_home = hermes_home.with_name("old-hermes")
+
+    def claim_then_replace(*args, **kwargs):
+        record = original_claim(*args, **kwargs)
+        hermes_home.rename(old_home)
+        hermes_home.mkdir()
+        (hermes_home / "state.db").touch()
+        return record
+
+    monkeypatch.setattr(coordinator, "claim", claim_then_replace)
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        coordinator.recover_once(lambda *_args: pytest.fail("replacement dispatched"))
+
+    old_lease = coordinator.get("directory-race")
+    assert old_lease is not None
+    assert old_lease.owner_id is None
+    assert "identity" in str(old_lease.last_error).lower()
 
 
 def test_supervisor_is_owned_idempotent_and_closes_every_profile(tmp_path):
@@ -186,6 +421,84 @@ def test_supervisor_stop_timeout_retains_thread_and_coordinators_until_exit(tmp_
     assert coordinator.closed == 1
     assert supervisor.stop(timeout=1.0) is True
     assert coordinator.closed == 1
+
+
+def test_shutdown_racing_scan_rejects_late_submit_without_thread_exception(
+    tmp_path, monkeypatch
+):
+    from concurrent.futures import Future
+    from hermes_cli import goal_execution
+    from hermes_cli.goal_execution import GoalRecoverySupervisor
+
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    discovery_entered = threading.Event()
+    release_discovery = threading.Event()
+    thread_finished = threading.Event()
+    captured_thread_exceptions = []
+    discovery_calls = 0
+
+    class Executor:
+        def __init__(self, **_kwargs):
+            self.shutdown_called = False
+            self.submissions = 0
+
+        def submit(self, fn, *args):
+            if self.shutdown_called:
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            self.submissions += 1
+            future = Future()
+            future.set_result(fn(*args))
+            return future
+
+        def shutdown(self, **_kwargs):
+            self.shutdown_called = True
+
+    executor = Executor()
+
+    def discover(*_args, **_kwargs):
+        nonlocal discovery_calls
+        discovery_calls += 1
+        if discovery_calls == 2:
+            discovery_entered.set()
+            assert release_discovery.wait(timeout=5)
+        return [launch.resolve()]
+
+    class Coordinator:
+        def bootstrap_reconcile(self):
+            pass
+        def recover_once(self, _dispatch):
+            return 0
+        def close(self):
+            pass
+
+    monkeypatch.setattr(goal_execution, "discover_goal_profile_homes", discover)
+    monkeypatch.setattr(
+        threading,
+        "excepthook",
+        lambda args: captured_thread_exceptions.append(args.exc_value),
+    )
+    supervisor = GoalRecoverySupervisor(
+        launch,
+        coordinator_factory=lambda _home: Coordinator(),
+        executor_factory=lambda **_kwargs: executor,
+    )
+    assert supervisor.scan_once() == 0
+
+    scanner = threading.Thread(
+        target=lambda: (supervisor.scan_once(), thread_finished.set())
+    )
+    scanner.start()
+    assert discovery_entered.wait(timeout=5)
+    assert supervisor.close(timeout=1.0) is True
+    release_discovery.set()
+    scanner.join(timeout=5)
+
+    assert not scanner.is_alive()
+    assert thread_finished.is_set()
+    assert captured_thread_exceptions == []
+    assert executor.submissions == 1
+    assert supervisor.scan_once() == 0
 
 
 def test_supervisor_isolates_profile_errors_and_retries_later(tmp_path):
@@ -295,22 +608,43 @@ def test_stop_event_wakes_scheduler_without_real_sleep(tmp_path):
     assert waits == [7.0]
 
 
-def test_process_registry_reuses_supervisor_across_real_module_reload():
-    from hermes_cli import goal_execution
+def test_process_registry_reuses_supervisor_across_real_module_reload(tmp_path):
+    """Exercise a real reload without replacing this pytest process's classes."""
+    child_home = tmp_path / "reload-hermes-home"
+    child_home.mkdir()
+    script = textwrap.dedent(
+        """
+        import importlib
+        import threading
 
-    key = "test-reload-singleton"
-    created = []
-    first = goal_execution.get_goal_recovery_supervisor(
-        key, lambda: created.append(object()) or created[-1]
-    )
-    reloaded = importlib.reload(goal_execution)
-    try:
+        from hermes_cli import goal_execution
+
+        key = "test-reload-singleton"
+        created = []
+        first = goal_execution.get_goal_recovery_supervisor(
+            key, lambda: created.append(object()) or created[-1]
+        )
+        reloaded = importlib.reload(goal_execution)
         second = reloaded.get_goal_recovery_supervisor(key, lambda: object())
         assert first is second
         assert len(created) == 1
-    finally:
         assert reloaded.clear_goal_recovery_supervisor(key, first) is True
         assert reloaded.clear_goal_recovery_supervisor(key, first) is False
+        assert threading.enumerate() == [threading.main_thread()]
+        """
+    )
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(child_home)
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_bootstrap_decodes_only_active_rows_and_steady_state_uses_due_index(
@@ -325,6 +659,7 @@ def test_bootstrap_decodes_only_active_rows_and_steady_state_uses_due_index(
         manager.set("old")
         manager.pause("archived")
     active = GoalManager("active-session").set("resume this")
+    _remove_goal_execution_leases_for_legacy_fixture(hermes_home)
     decoded = 0
     original = goals.GoalState.from_json
 
@@ -349,6 +684,43 @@ def test_bootstrap_decodes_only_active_rows_and_steady_state_uses_due_index(
     assert [record.session_id for record, _state in dispatched] == ["active-session"]
 
 
+def test_post_bootstrap_active_goal_is_immediately_visible_without_restart(
+    hermes_home, monkeypatch
+):
+    from hermes_cli.goal_execution import GoalExecutionCoordinator, GoalRecoverySupervisor
+    from hermes_cli.goals import GoalManager
+
+    recovered = []
+    coordinator = GoalExecutionCoordinator(
+        hermes_home, owner_id="live-supervisor", clock=lambda: 10**12
+    )
+    supervisor = GoalRecoverySupervisor(
+        hermes_home,
+        coordinator_factory=lambda _home: coordinator,
+        dispatch=lambda record, state: recovered.append((record.session_id, state.goal)),
+        clock=lambda: 10**12,
+    )
+
+    assert supervisor.scan_once() == 0
+    assert hermes_home.resolve() in supervisor._bootstrapped
+
+    def unexpected_reconciliation(*_args, **_kwargs):
+        pytest.fail("post-bootstrap insert must not require reconciliation")
+
+    monkeypatch.setattr(coordinator, "bootstrap_reconcile", unexpected_reconciliation)
+    monkeypatch.setattr(coordinator, "bootstrap_reconcile_page", unexpected_reconciliation)
+
+    state = GoalManager("inserted-after-bootstrap").set("recover now")
+    lease = coordinator.get("inserted-after-bootstrap")
+    assert lease is not None
+    assert lease.generation == state.generation
+    assert lease.owner_id is None
+    assert lease.next_run_at > 0
+    assert supervisor.scan_once() == 1
+    assert recovered == [("inserted-after-bootstrap", "recover now")]
+    assert supervisor.close(timeout=1.0) is True
+
+
 def test_steady_state_due_scan_is_bounded(hermes_home):
     from hermes_cli.goal_execution import GoalExecutionCoordinator
     from hermes_cli.goals import GoalManager
@@ -368,6 +740,41 @@ def test_steady_state_due_scan_is_bounded(hermes_home):
         lambda record, _state: dispatched.append(record.session_id)
     ) == 7
     assert len(dispatched) == 7
+
+
+def test_capacity_rejection_reschedules_exact_claim_without_burning_attempt(
+    hermes_home,
+):
+    from hermes_cli.goal_execution import (
+        GoalExecutionCoordinator,
+        RecoveryTurnAdmission,
+    )
+    from hermes_cli.goals import GoalManager
+
+    state = GoalManager("capacity-deferred").set("work later")
+    coordinator = GoalExecutionCoordinator(
+        hermes_home, owner_id="recovery", clock=lambda: 100.0
+    )
+
+    result = coordinator.recover_once(
+        lambda _record, _state: RecoveryTurnAdmission(
+            accepted=False,
+            retry_after_seconds=0.5,
+            reason="recovery turn capacity exhausted",
+        )
+    )
+
+    assert result.claimed == 1
+    assert result.accepted == 0
+    assert result.failed == 0
+    lease = coordinator.get("capacity-deferred")
+    assert lease is not None
+    assert lease.generation == state.generation
+    assert lease.owner_id is None
+    assert lease.claim_token is None
+    assert lease.next_run_at == pytest.approx(100.5)
+    assert lease.attempt == 0
+    assert lease.last_error == "recovery turn capacity exhausted"
 
 
 def test_timed_wait_wakes_through_coordinator_after_deadline(hermes_home):
@@ -465,6 +872,32 @@ def test_synchronous_recovery_failures_pause_after_finite_attempts(hermes_home):
     assert record.next_run_at == 0
 
 
+def test_recovery_result_distinguishes_acceptance_completion_and_failure(hermes_home):
+    from hermes_cli.goal_execution import GoalExecutionCoordinator, RecoveryTurnAdmission
+    from hermes_cli.goals import GoalManager
+
+    GoalManager("accepted-only").set("queued")
+    GoalManager("completed-now").set("done")
+    GoalManager("failed-now").set("retry")
+    coordinator = GoalExecutionCoordinator(
+        hermes_home, owner_id="accounting", clock=lambda: 100.0
+    )
+
+    def dispatch(record, _state):
+        if record.session_id == "accepted-only":
+            return RecoveryTurnAdmission(accepted=True)
+        if record.session_id == "failed-now":
+            raise RuntimeError("scheduled failure")
+        return None
+
+    result = coordinator.recover_once(dispatch)
+
+    assert result.accepted == 2
+    assert result.completed == 1
+    assert result.failed == 1
+    assert int(result) == 1
+
+
 def test_failed_recovery_pause_is_fenced_to_original_generation_and_token(hermes_home):
     from hermes_cli.goal_execution import GoalExecutionCoordinator
     from hermes_cli.goals import GoalManager
@@ -508,6 +941,7 @@ def test_bootstrap_pages_are_bounded_complete_and_restart_safe(hermes_home):
 
     for index in range(1001):
         GoalManager(f"active-{index:04d}").set("work")
+    _remove_goal_execution_leases_for_legacy_fixture(hermes_home)
 
     first = GoalExecutionCoordinator(hermes_home, owner_id="first", clock=lambda: 100.0)
     seeded, complete = first.bootstrap_reconcile_page(limit=1000)
@@ -586,3 +1020,119 @@ def test_scheduler_dispatches_profiles_in_parallel_single_flight(tmp_path):
     assert calls.count(launch.resolve()) == 1
     release.set()
     supervisor.close(timeout=2)
+
+
+def test_async_recovery_success_is_accounted_only_on_terminal_completion(tmp_path):
+    from concurrent.futures import Future
+    from hermes_cli.goal_execution import GoalRecoverySupervisor, RecoveryScanResult
+
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    completion = Future()
+
+    class Coordinator:
+        def bootstrap_reconcile_page(self):
+            return 0, True
+        def recover_once(self, _dispatch):
+            return RecoveryScanResult(accepted=1, completions=(completion,))
+        def close(self):
+            pass
+
+    supervisor = GoalRecoverySupervisor(launch, coordinator_factory=lambda _home: Coordinator())
+    supervisor.profile_errors[launch.resolve()] = RuntimeError("prior")
+
+    assert supervisor.scan_once() == 0
+    assert (supervisor.accepted, supervisor.completed, supervisor.failed) == (1, 0, 0)
+    assert launch.resolve() in supervisor.profile_errors
+
+    completion.set_result(None)
+    assert (supervisor.accepted, supervisor.completed, supervisor.failed) == (1, 1, 0)
+    assert launch.resolve() not in supervisor.profile_errors
+
+
+def test_async_recovery_failure_is_accounted_after_durable_retry(tmp_path):
+    from concurrent.futures import Future
+    from hermes_cli.goal_execution import GoalRecoverySupervisor, RecoveryScanResult
+
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    completion = Future()
+
+    class Coordinator:
+        def bootstrap_reconcile_page(self):
+            return 0, True
+        def recover_once(self, _dispatch):
+            return RecoveryScanResult(accepted=1, completions=(completion,))
+        def close(self):
+            pass
+
+    supervisor = GoalRecoverySupervisor(launch, coordinator_factory=lambda _home: Coordinator())
+    assert supervisor.scan_once() == 0
+    completion.set_exception(RuntimeError("retry was scheduled"))
+
+    assert (supervisor.accepted, supervisor.completed, supervisor.failed) == (1, 0, 1)
+    assert "retry was scheduled" in str(supervisor.profile_errors[launch.resolve()])
+
+
+def test_old_async_success_cannot_clear_newer_profile_failure(tmp_path):
+    from concurrent.futures import Future
+    from hermes_cli.goal_execution import GoalRecoverySupervisor, RecoveryScanResult
+
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    old = Future()
+    newer = Future()
+    completions = iter((old, newer))
+
+    class Coordinator:
+        def bootstrap_reconcile_page(self):
+            return 0, True
+        def recover_once(self, _dispatch):
+            return RecoveryScanResult(accepted=1, completions=(next(completions),))
+        def close(self):
+            pass
+
+    supervisor = GoalRecoverySupervisor(launch, coordinator_factory=lambda _home: Coordinator())
+    assert supervisor.scan_once() == 0
+    assert supervisor.scan_once() == 0
+
+    newer.set_exception(RuntimeError("newer failure"))
+    old.set_result(None)
+
+    assert (supervisor.accepted, supervisor.completed, supervisor.failed) == (2, 1, 1)
+    assert "newer failure" in str(supervisor.profile_errors[launch.resolve()])
+
+
+def test_old_async_failure_cannot_restore_error_after_newer_profile_success(tmp_path):
+    from concurrent.futures import Future
+    from hermes_cli.goal_execution import GoalRecoverySupervisor, RecoveryScanResult
+
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    old = Future()
+    newer = Future()
+    completions = iter((old, newer))
+
+    class Coordinator:
+        def bootstrap_reconcile_page(self):
+            return 0, True
+        def recover_once(self, _dispatch):
+            return RecoveryScanResult(accepted=1, completions=(next(completions),))
+        def close(self):
+            pass
+
+    supervisor = GoalRecoverySupervisor(
+        launch,
+        coordinator_factory=lambda _home: Coordinator(),
+        clock=lambda: 100.0,
+        error_backoff_seconds=5.0,
+    )
+    assert supervisor.scan_once() == 0
+    assert supervisor.scan_once() == 0
+
+    newer.set_result(None)
+    old.set_exception(RuntimeError("older failure"))
+
+    assert (supervisor.accepted, supervisor.completed, supervisor.failed) == (2, 1, 1)
+    assert launch.resolve() not in supervisor.profile_errors
+    assert launch.resolve() not in supervisor._retry_after

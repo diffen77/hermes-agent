@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 import uuid
 import logging
+import os
+import stat
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor, wait as wait_futures
 from dataclasses import dataclass
@@ -16,6 +18,133 @@ from hermes_cli._goal_execution_registry import SUPERVISORS, SUPERVISORS_LOCK
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RecoveryTurnAdmission:
+    """Dispatch acknowledgement; acceptance is not turn completion."""
+
+    accepted: bool
+    completed: bool = False
+    retry_after_seconds: float | None = None
+    reason: str = ""
+    completion: Future | None = None
+
+
+@dataclass(frozen=True)
+class RecoveryScanResult:
+    """Truthful accounting for one durable recovery scan."""
+
+    claimed: int = 0
+    accepted: int = 0
+    completed: int = 0
+    failed: int = 0
+    completions: tuple[Future, ...] = ()
+
+    def __int__(self) -> int:
+        # Compatibility for callers whose historical integer meant a
+        # synchronously completed dispatch, never merely a claimed lease.
+        return self.completed
+
+    def __eq__(self, other):
+        if isinstance(other, int):
+            return self.completed == other
+        if isinstance(other, RecoveryScanResult):
+            return (
+                self.claimed,
+                self.accepted,
+                self.completed,
+                self.failed,
+                self.completions,
+            ) == (
+                other.claimed,
+                other.accepted,
+                other.completed,
+                other.failed,
+                other.completions,
+            )
+        return NotImplemented
+
+
+@dataclass(frozen=True)
+class GoalProfileIdentity:
+    """Canonical path and filesystem objects trusted by one recovery owner."""
+
+    home: Path
+    directory_device: int
+    directory_inode: int
+    database_device: int | None
+    database_inode: int | None
+
+
+def _capture_profile_identity(
+    home: Path | str, *, allow_missing_db: bool = False
+) -> GoalProfileIdentity:
+    """Capture a canonical, non-aliased profile and optional state database."""
+
+    profile = Path(home).expanduser().absolute()
+    profile_lstat = profile.lstat()
+    if stat.S_ISLNK(profile_lstat.st_mode) or not stat.S_ISDIR(profile_lstat.st_mode):
+        raise RuntimeError(f"unsafe goal profile directory: {profile}")
+    if profile.resolve() != profile:
+        raise RuntimeError(f"non-canonical goal profile directory: {profile}")
+    state_db = profile / "state.db"
+    try:
+        db_lstat = state_db.lstat()
+    except FileNotFoundError:
+        if allow_missing_db:
+            return GoalProfileIdentity(
+                profile,
+                int(profile_lstat.st_dev),
+                int(profile_lstat.st_ino),
+                None,
+                None,
+            )
+        raise
+    if stat.S_ISLNK(db_lstat.st_mode) or not stat.S_ISREG(db_lstat.st_mode):
+        raise RuntimeError(f"unsafe goal profile state.db: {state_db}")
+    if int(db_lstat.st_nlink) != 1:
+        raise RuntimeError(f"unsafe hardlinked goal profile state.db: {state_db}")
+    if state_db.resolve().parent != profile:
+        raise RuntimeError(f"goal profile state.db escapes exact profile: {state_db}")
+    return GoalProfileIdentity(
+        profile,
+        int(profile_lstat.st_dev),
+        int(profile_lstat.st_ino),
+        int(db_lstat.st_dev),
+        int(db_lstat.st_ino),
+    )
+
+
+def _exact_profile_db_identity(home: Path) -> tuple[int, int]:
+    """Compatibility helper returning the exact safe database identity."""
+
+    identity = _capture_profile_identity(home)
+    assert identity.database_device is not None and identity.database_inode is not None
+    return identity.database_device, identity.database_inode
+
+
+def _verify_database_open_identity(identity: GoalProfileIdentity) -> None:
+    """Minimize validation/open TOCTOU with a no-follow descriptor when available."""
+
+    if identity.database_inode is None:
+        return
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(identity.home / "state.db", flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or int(opened.st_nlink) != 1
+            or int(opened.st_dev) != identity.database_device
+            or int(opened.st_ino) != identity.database_inode
+        ):
+            raise RuntimeError(
+                f"goal profile state.db identity changed while opening: {identity.home}"
+            )
+    finally:
+        os.close(descriptor)
 
 
 def get_goal_recovery_supervisor(key: str, factory):
@@ -46,7 +175,8 @@ def discover_goal_profile_homes(
     already owns ``state.db``; no unrelated trees or arbitrary files are
     inspected.
     """
-    launch = Path(launch_home).expanduser().resolve()
+    launch_identity = _capture_profile_identity(launch_home, allow_missing_db=True)
+    launch = launch_identity.home
     homes = [launch]
     if profiles_root is None:
         import hermes_constants
@@ -64,15 +194,13 @@ def discover_goal_profile_homes(
         children = []
     for child in children:
         try:
-            if child.is_symlink():
-                continue
+            child = child.absolute()
             resolved = child.resolve()
             resolved.relative_to(root)
-            state_db = child / "state.db"
-            state_db.resolve().relative_to(root)
-            if child.is_dir() and state_db.is_file() and resolved != launch:
+            _capture_profile_identity(child)
+            if resolved != launch:
                 homes.append(resolved)
-        except (OSError, ValueError):
+        except (OSError, RuntimeError, ValueError):
             continue
     return homes
 
@@ -96,7 +224,10 @@ class GoalRecoverySupervisor:
         recovery_workers: int = 4,
         executor_factory=ThreadPoolExecutor,
     ) -> None:
-        self.launch_home = Path(launch_home).expanduser().resolve()
+        self._launch_identity = _capture_profile_identity(
+            launch_home, allow_missing_db=True
+        )
+        self.launch_home = self._launch_identity.home
         self.profiles_root = profiles_root
         self.coordinator_factory = coordinator_factory or GoalExecutionCoordinator
         self.dispatch = dispatch or (lambda *_args: None)
@@ -111,12 +242,29 @@ class GoalRecoverySupervisor:
         self.thread = None
         self._executor = None
         self._lock = threading.Lock()
+        self._lifecycle = threading.Condition(self._lock)
+        self._submissions_inflight = 0
+        self._submitting_profiles: set[Path] = set()
+        self._stopping = False
+        self._closed = False
         self._coordinators: dict[Path, object] = {}
         self._bootstrapped: set[Path] = set()
         self._retry_after: dict[Path, float] = {}
         self.profile_errors: dict[Path, BaseException] = {}
         self.closed_coordinators: list[object] = []
         self._profile_futures: dict[Path, Future] = {}
+        self._profile_identities: dict[Path, GoalProfileIdentity] = {
+            self.launch_home: self._launch_identity
+        }
+        self._completion_futures: set[Future] = set()
+        self._accounting_epoch = 0
+        # Ordering must survive a successful outcome.  Terminal callbacks can
+        # arrive out of order, so clearing this on success would let an older
+        # failure restore stale error/backoff state.
+        self._profile_terminal_epochs: dict[Path, int] = {}
+        self.accepted = 0
+        self.completed = 0
+        self.failed = 0
 
     def _finish_stopped_thread_locked(self, thread) -> None:
         """Detach one exited owned thread and close its coordinators once."""
@@ -137,12 +285,15 @@ class GoalRecoverySupervisor:
     def start(self) -> bool:
         self._collect_completed(now=float(self.clock()))
         with self._lock:
+            if self._closed:
+                return False
             if self.thread is not None:
                 if self.thread.is_alive():
                     return False
                 if self._profile_futures:
                     return False
                 self._finish_stopped_thread_locked(self.thread)
+            self._stopping = False
             self.stop_event.clear()
             self._ensure_executor_locked()
             self.thread = self.thread_factory(
@@ -162,11 +313,41 @@ class GoalRecoverySupervisor:
             )
         return self._executor
 
-    def _recover_profile(self, home: Path) -> int:
+    def _recover_profile(self, home: Path):
+        with self._lock:
+            expected_identity = self._profile_identities.get(home)
+        if expected_identity is None:
+            raise RuntimeError(f"missing expected goal profile identity: {home}")
+        current_identity = _capture_profile_identity(
+            home, allow_missing_db=(home == self.launch_home and expected_identity.database_inode is None)
+        )
+        if current_identity != expected_identity:
+            raise RuntimeError(f"goal profile identity changed before recovery: {home}")
         with self._lock:
             coordinator = self._coordinators.get(home)
         if coordinator is None:
             created = self.coordinator_factory(home)
+            try:
+                opened_identity = _capture_profile_identity(
+                    home, allow_missing_db=(expected_identity.database_inode is None)
+                )
+                if (
+                    opened_identity.home != expected_identity.home
+                    or opened_identity.directory_device != expected_identity.directory_device
+                    or opened_identity.directory_inode != expected_identity.directory_inode
+                    or (
+                        expected_identity.database_inode is not None
+                        and opened_identity != expected_identity
+                    )
+                ):
+                    raise RuntimeError(f"goal profile identity changed during open: {home}")
+            except BaseException:
+                try:
+                    created.close()
+                finally:
+                    raise
+            with self._lock:
+                self._profile_identities[home] = opened_identity
             with self._lock:
                 coordinator = self._coordinators.setdefault(home, created)
             if coordinator is not created:
@@ -183,9 +364,57 @@ class GoalRecoverySupervisor:
             if complete:
                 with self._lock:
                     self._bootstrapped.add(home)
+        expected_identity = self._profile_identities[home]
+        if _capture_profile_identity(
+            home, allow_missing_db=(expected_identity.database_inode is None)
+        ) != expected_identity:
+            raise RuntimeError(f"goal profile identity changed before recovery dispatch: {home}")
         if self.recover_callback is None:
-            return int(coordinator.recover_once(self.dispatch))
-        return int(self.recover_callback(coordinator))
+            return coordinator.recover_once(self.dispatch)
+        return self.recover_callback(coordinator)
+
+    def _next_accounting_epoch(self) -> int:
+        with self._lock:
+            self._accounting_epoch += 1
+            return self._accounting_epoch
+
+    def _record_profile_failure(self, home: Path, epoch: int, exc: BaseException, now: float) -> None:
+        with self._lock:
+            if epoch < self._profile_terminal_epochs.get(home, -1):
+                return
+            self._profile_terminal_epochs[home] = epoch
+            self.profile_errors[home] = exc
+            self._retry_after[home] = now + self.error_backoff_seconds
+
+    def _record_profile_success(self, home: Path, epoch: int) -> None:
+        with self._lock:
+            if self._profile_terminal_epochs.get(home, -1) > epoch:
+                return
+            self._profile_terminal_epochs[home] = epoch
+            self.profile_errors.pop(home, None)
+            self._retry_after.pop(home, None)
+
+    def _track_terminal_completion(self, home: Path, future: Future, epoch: int) -> None:
+        with self._lock:
+            self._completion_futures.add(future)
+
+        def account(done: Future) -> None:
+            now = float(self.clock())
+            try:
+                done.result()
+            except BaseException as exc:
+                with self._lock:
+                    self.failed += 1
+                self._record_profile_failure(home, epoch, exc, now)
+            else:
+                with self._lock:
+                    self.completed += 1
+                self._record_profile_success(home, epoch)
+            finally:
+                with self._lock:
+                    self._completion_futures.discard(done)
+
+        future.add_done_callback(account)
 
     def _collect_completed(self, *, now: float) -> int:
         recovered = 0
@@ -198,13 +427,32 @@ class GoalRecoverySupervisor:
             for home, _future in completed:
                 self._profile_futures.pop(home, None)
         for home, future in completed:
+            epoch = self._next_accounting_epoch()
             try:
-                recovered += int(future.result())
-                self.profile_errors.pop(home, None)
-                self._retry_after.pop(home, None)
+                result = future.result()
+                if isinstance(result, RecoveryScanResult):
+                    recovered += result.completed
+                    with self._lock:
+                        self.accepted += result.accepted
+                        self.completed += result.completed
+                        self.failed += result.failed
+                    if result.failed:
+                        self._record_profile_failure(
+                            home,
+                            epoch,
+                            RuntimeError(f"{result.failed} recovery turn dispatch(es) failed"),
+                            now,
+                        )
+                    elif result.completed or not result.accepted:
+                        self._record_profile_success(home, epoch)
+                    for completion in result.completions:
+                        completion_epoch = self._next_accounting_epoch()
+                        self._track_terminal_completion(home, completion, completion_epoch)
+                else:
+                    recovered += int(result)
+                    self._record_profile_success(home, epoch)
             except Exception as exc:
-                self.profile_errors[home] = exc
-                self._retry_after[home] = now + self.error_backoff_seconds
+                self._record_profile_failure(home, epoch, exc, now)
                 logger.warning("goal recovery failed for profile %s: %s", home, exc)
         return recovered
 
@@ -217,11 +465,92 @@ class GoalRecoverySupervisor:
         ):
             if self._retry_after.get(home, 0.0) > now:
                 continue
+            try:
+                discovered_identity = _capture_profile_identity(
+                    home, allow_missing_db=(home == self.launch_home)
+                )
+            except BaseException as exc:
+                epoch = self._next_accounting_epoch()
+                self._record_profile_failure(home, epoch, exc, now)
+                continue
             with self._lock:
-                if home in self._profile_futures:
+                pinned_identity = self._profile_identities.get(home)
+                renamed_from = next(
+                    (
+                        pinned_home
+                        for pinned_home, identity in self._profile_identities.items()
+                        if pinned_home != home
+                        and pinned_home in self._coordinators
+                        and (
+                            identity.directory_device,
+                            identity.directory_inode,
+                            identity.database_device,
+                            identity.database_inode,
+                        )
+                        == (
+                            discovered_identity.directory_device,
+                            discovered_identity.directory_inode,
+                            discovered_identity.database_device,
+                            discovered_identity.database_inode,
+                        )
+                    ),
+                    None,
+                )
+                if renamed_from is not None:
+                    self._accounting_epoch += 1
+                    epoch = self._accounting_epoch
+                    exc = RuntimeError(
+                        f"goal profile identity renamed from {renamed_from} to {home}"
+                    )
+                    for unsafe_home in (renamed_from, home):
+                        self._profile_terminal_epochs[unsafe_home] = epoch
+                        self.profile_errors[unsafe_home] = exc
+                        self._retry_after[unsafe_home] = now + self.error_backoff_seconds
                     continue
-                future = self._ensure_executor_locked().submit(self._recover_profile, home)
-                self._profile_futures[home] = future
+                if (
+                    home in self._coordinators
+                    and pinned_identity is not None
+                    and discovered_identity != pinned_identity
+                ):
+                    self._accounting_epoch += 1
+                    epoch = self._accounting_epoch
+                    exc = RuntimeError(
+                        f"goal profile identity changed after coordinator open: {home}"
+                    )
+                    self._profile_terminal_epochs[home] = epoch
+                    self.profile_errors[home] = exc
+                    self._retry_after[home] = now + self.error_backoff_seconds
+                    continue
+                if (
+                    self._closed
+                    or self._stopping
+                    or home in self._profile_futures
+                    or home in self._submitting_profiles
+                ):
+                    continue
+                executor = self._ensure_executor_locked()
+                self._profile_identities[home] = discovered_identity
+                self._submitting_profiles.add(home)
+                self._submissions_inflight += 1
+            future = None
+            try:
+                # Calling a custom executor under ``_lock`` deadlocks when it
+                # runs callbacks inline, since recovery itself needs the lock.
+                # The admission count prevents shutdown from detaching the
+                # executor while this submission is outside the lock.
+                future = executor.submit(self._recover_profile, home)
+            except RuntimeError as exc:
+                # Contain an unexpected executor lifecycle race instead of
+                # crashing the scheduler thread with submit-after-shutdown.
+                self.profile_errors[home] = exc
+            finally:
+                with self._lifecycle:
+                    self._submitting_profiles.discard(home)
+                    self._submissions_inflight -= 1
+                    if future is not None:
+                        self._profile_futures[home] = future
+                    self._lifecycle.notify_all()
+            if future is not None:
                 submitted.append(future)
         if wait and submitted:
             wait_futures(submitted)
@@ -229,25 +558,91 @@ class GoalRecoverySupervisor:
         return recovered
 
     def stop(self, *, timeout: float | None = 5.0) -> bool:
+        if not self.stop_workers(timeout=timeout):
+            return False
         with self._lock:
+            coordinators = list(self._coordinators.values())
+            self._coordinators.clear()
+            self._bootstrapped.clear()
+            self._retry_after.clear()
+        for coordinator in coordinators:
+            try:
+                coordinator.close()
+            except Exception:
+                logger.debug("goal coordinator close failed", exc_info=True)
+        self.closed_coordinators.extend(coordinators)
+        return True
+
+    def stop_workers(self, *, timeout: float | None = 5.0) -> bool:
+        """Stop and join scheduler/profile workers without closing profile DBs."""
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        with self._lifecycle:
             thread = self.thread
             if thread is None:
                 return False
+            self._stopping = True
             self.stop_event.set()
         thread.join(timeout=timeout)
         if thread.is_alive():
             return False
-        if not self.close(timeout=timeout):
-            return False
+        with self._lifecycle:
+            while self._submissions_inflight:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._lifecycle.wait(remaining)
+            futures = list(self._profile_futures.values())
+        if futures:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            _done, pending = wait_futures(futures, timeout=remaining)
+            if pending:
+                return False
+            self._collect_completed(now=float(self.clock()))
         with self._lock:
-            self._finish_stopped_thread_locked(thread)
+            executor = self._executor
+            self._executor = None
+            self.thread = None
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=False)
+        return True
+
+    def detach_coordinators(self) -> list[object]:
+        """Drop coordinator references after an external owner closed them."""
+        with self._lock:
+            coordinators = list(self._coordinators.values())
+            self._coordinators.clear()
+            self._bootstrapped.clear()
+            self._retry_after.clear()
+        return coordinators
+
+    def _legacy_stop(self, *, timeout: float | None = 5.0) -> bool:
+        """Compatibility shim retained for reload-stable instances."""
+        if not self.stop(timeout=timeout):
+            return False
         return True
 
     def close(self, *, timeout: float | None = 5.0) -> bool:
-        with self._lock:
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        with self._lifecycle:
+            self._closed = True
+            self._stopping = True
+            self.stop_event.set()
+            thread = self.thread
+        if thread is not None:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            thread.join(timeout=remaining)
+            if thread.is_alive():
+                return False
+        with self._lifecycle:
+            while self._submissions_inflight:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._lifecycle.wait(remaining)
             futures = list(self._profile_futures.values())
         if futures:
-            _done, pending = wait_futures(futures, timeout=timeout)
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            _done, pending = wait_futures(futures, timeout=remaining)
             if pending:
                 return False
             self._collect_completed(now=float(self.clock()))
@@ -257,6 +652,7 @@ class GoalRecoverySupervisor:
             self._bootstrapped.clear()
             executor = self._executor
             self._executor = None
+            self.thread = None
         for coordinator in coordinators:
             try:
                 coordinator.close()
@@ -295,7 +691,8 @@ class GoalExecutionCoordinator:
         max_recovery_attempts: int = 5,
         recovery_batch_limit: int = 100,
     ) -> None:
-        self.home = Path(home)
+        before_open = _capture_profile_identity(home, allow_missing_db=True)
+        self.home = before_open.home
         self.owner_id = owner_id or f"backend-{uuid.uuid4().hex}"
         self.clock = clock
         self.lease_seconds = max(1.0, float(lease_seconds))
@@ -309,7 +706,27 @@ class GoalExecutionCoordinator:
             raise ValueError("recovery_batch_limit must be a positive integer") from exc
         if self.recovery_batch_limit < 1:
             raise ValueError("recovery_batch_limit must be a positive integer")
+        _verify_database_open_identity(before_open)
         self.db = SessionDB(self.home / "state.db")
+        try:
+            self.profile_identity = _capture_profile_identity(self.home)
+            if (
+                self.profile_identity.home != before_open.home
+                or self.profile_identity.directory_device != before_open.directory_device
+                or self.profile_identity.directory_inode != before_open.directory_inode
+                or (
+                    before_open.database_inode is not None
+                    and self.profile_identity != before_open
+                )
+            ):
+                raise RuntimeError(f"goal profile identity changed during database open: {self.home}")
+        except BaseException:
+            self.db.close()
+            raise
+
+    def validate_profile_identity(self) -> None:
+        if _capture_profile_identity(self.home) != self.profile_identity:
+            raise RuntimeError(f"goal profile identity changed: {self.home}")
 
     def close(self) -> None:
         self.db.close()
@@ -440,12 +857,15 @@ class GoalExecutionCoordinator:
             now=float(self.clock()),
         )
 
-    def recover_once(self, dispatch: Callable[[GoalExecutionRecord, object], None]) -> int:
+    def recover_once(
+        self, dispatch: Callable[[GoalExecutionRecord, object], object]
+    ) -> RecoveryScanResult:
         """Claim and dispatch indexed due goals; never scan historical state."""
         from hermes_cli.goals import GoalState, _pid_alive, _session_waiting
 
         now = float(self.clock())
-        claimed = 0
+        claimed = accepted = completed = failed = 0
+        completions = []
         for due in self.due_records(now=now):
             try:
                 raw = self.db.get_meta(f"goal:{due.session_id}")
@@ -464,9 +884,11 @@ class GoalExecutionCoordinator:
                 # equal-generation claim established after this scan snapshot.
                 self.invalidate(session_id, due.generation)
                 continue
+            self.validate_profile_identity()
             record = self.claim(session_id, generation)
             if record is None:
                 continue
+            claimed += 1
             waiting_until = float(state.waiting_until or 0.0)
             waiting_live = bool(
                 (state.waiting_on_pid and _pid_alive(state.waiting_on_pid))
@@ -484,9 +906,43 @@ class GoalExecutionCoordinator:
                 )
                 continue
             try:
-                dispatch(record, state)
-                claimed += 1
+                try:
+                    self.validate_profile_identity()
+                except RuntimeError as exc:
+                    self.schedule(
+                        session_id,
+                        generation,
+                        record.claim_token or "",
+                        next_run_at=now + self.wait_poll_seconds,
+                        reason=f"profile security error: {exc}",
+                    )
+                    raise
+                admission = dispatch(record, state)
+                if isinstance(admission, RecoveryTurnAdmission):
+                    if admission.accepted:
+                        accepted += 1
+                    if admission.completed:
+                        completed += 1
+                    if admission.completion is not None:
+                        completions.append(admission.completion)
+                    if not admission.accepted and admission.retry_after_seconds is not None:
+                        self.schedule(
+                            session_id,
+                            generation,
+                            record.claim_token or "",
+                            next_run_at=now
+                            + max(0.01, float(admission.retry_after_seconds)),
+                            reason=admission.reason or "recovery turn admission deferred",
+                        )
+                else:
+                    # Existing synchronous dispatch callbacks complete when
+                    # they return. This preserves their truthful old contract.
+                    accepted += 1
+                    completed += 1
             except Exception as exc:
+                if "profile identity changed" in str(exc):
+                    raise
+                failed += 1
                 attempt = record.attempt + 1
                 failure = f"continuation dispatch failed: {type(exc).__name__}: {exc}"
                 if attempt >= self.max_recovery_attempts:
@@ -506,4 +962,10 @@ class GoalExecutionCoordinator:
                         reason=failure,
                         increment_attempt=True,
                     )
-        return claimed
+        return RecoveryScanResult(
+            claimed=claimed,
+            accepted=accepted,
+            completed=completed,
+            failed=failed,
+            completions=tuple(completions),
+        )
