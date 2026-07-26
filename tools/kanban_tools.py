@@ -1186,6 +1186,9 @@ def _handle_create(args: dict, **kw) -> str:
     goal_max_turns = args.get("goal_max_turns")
     model_override = args.get("model")
     provider_override = args.get("provider")
+    specialist_contract = args.get("specialist_contract")
+    if specialist_contract is not None and not isinstance(specialist_contract, dict):
+        return tool_error("'specialist_contract' must be an object")
     if provider_override and not model_override:
         return tool_error("'provider' requires 'model' to be set as well")
     if isinstance(parents, str):
@@ -1229,6 +1232,7 @@ def _handle_create(args: dict, **kw) -> str:
                 skills=skills,
                 model_override=model_override,
                 provider_override=provider_override,
+                specialist_contract=specialist_contract,
                 goal_mode=goal_mode,
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
@@ -1971,6 +1975,15 @@ KANBAN_CREATE_SCHEMA = {
                     "the profile's provider and will fail if it belongs "
                     "to a different one. Requires 'model'."
                 ),
+            },
+            "specialist_contract": {
+                "type": "object",
+                "description": (
+                    "Optional task-local role/capability/route/probe contract. "
+                    "Assignee/provider/model must match selected_route; dispatch "
+                    "requires a current fallback-disabled live probe receipt."
+                ),
+                "additionalProperties": True,
             },
             "board": _board_schema_prop(),
         },
