@@ -296,7 +296,12 @@ def heartbeat_current_worker_from_env() -> bool:
         try:
             claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
             try:
-                kb.heartbeat_claim(conn, tid, claimer=claim_lock)
+                kb.heartbeat_claim(
+                    conn,
+                    tid,
+                    claimer=claim_lock,
+                    **_factory_worker_tuple(),
+                )
             except Exception:
                 logger.debug("auto-heartbeat: heartbeat_claim failed", exc_info=True)
             run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
@@ -346,6 +351,29 @@ def _parse_bool_arg(args: dict, name: str, *, default: bool = False):
     if text in {"false", "0", "no"}:
         return False, None
     return default, f"{name} must be a boolean or 'true'/'false'"
+
+
+def _factory_worker_tuple() -> dict[str, Any]:
+    """Read the dispatcher hint tuple passed to DB-backed FEC guards.
+
+    The values are never authority by themselves: ``kanban_db`` re-reads and
+    atomically compares the current run, generation, authorization and lease.
+    Invalid or absent integer hints become ``None`` so enforced tasks fail
+    closed while legacy task calls retain their existing behavior.
+    """
+    run_id = _worker_run_id(os.environ.get("HERMES_KANBAN_TASK"))
+    generation_raw = os.environ.get("HERMES_FACTORY_EXECUTION_GENERATION")
+    try:
+        generation = int(generation_raw) if generation_raw else None
+    except (TypeError, ValueError):
+        generation = None
+    return {
+        "expected_run_id": run_id,
+        "expected_generation": generation,
+        "authorization_id": (
+            os.environ.get("HERMES_FACTORY_AUTHORIZATION_ID") or None
+        ),
+    }
 
 
 def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
@@ -671,7 +699,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
-                    expected_run_id=_worker_run_id(tid),
+                    **_factory_worker_tuple(),
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -828,7 +856,12 @@ def _handle_heartbeat(args: dict, **kw) -> str:
             # default _claimer_id() covers locally-driven workers that
             # never went through the dispatcher path.
             claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-            kb.heartbeat_claim(conn, tid, claimer=claim_lock)
+            kb.heartbeat_claim(
+                conn,
+                tid,
+                claimer=claim_lock,
+                **_factory_worker_tuple(),
+            )
 
             ok = kb.heartbeat_worker(
                 conn,

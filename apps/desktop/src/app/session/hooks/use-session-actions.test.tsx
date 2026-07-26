@@ -488,6 +488,24 @@ describe('createBackendSessionForSend profile routing', () => {
     expect(params).toMatchObject({ cwd: '/remote/worktree' })
   })
 
+  it('pins the project that owns the captured new-session cwd', async () => {
+    const params = await createWith(() => {
+      $projectTree.set([
+        {
+          id: 'p_app',
+          label: 'App',
+          path: '/repo/app',
+          repos: [{ groups: [], id: '/repo/app', label: 'app', path: '/repo/app', sessionCount: 0 }],
+          sessionCount: 0
+        }
+      ])
+      $projectScope.set('p_app')
+      $currentCwd.set('/repo/app/worktree')
+    })
+
+    expect(params).toMatchObject({ cwd: '/repo/app/worktree', project_id: 'p_app' })
+  })
+
   it('freezes the visible selector state before profile readiness and sends fast: false explicitly', async () => {
     const profileReady = deferred<void>()
     vi.mocked(ensureGatewayProfile).mockReturnValueOnce(profileReady.promise)

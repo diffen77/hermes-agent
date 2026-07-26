@@ -2374,6 +2374,16 @@ def _ensure_session_db_row(session: dict) -> None:
     parent_session_id = session.get("parent_session_id") or None
     if parent_session_id:
         model_config["_branched_from"] = parent_session_id
+    project_kwargs = {}
+    if session.get("desktop_project_id"):
+        project_kwargs = {
+            "desktop_project_id": session.get("desktop_project_id"),
+            "desktop_project_binding": (
+                dict(session["project_binding"])
+                if isinstance(session.get("project_binding"), dict)
+                else None
+            ),
+        }
     try:
         db.create_session(
             key,
@@ -2386,6 +2396,7 @@ def _ensure_session_db_row(session: dict) -> None:
             # into one list can't rely on which file a row came from alone. NULL
             # means the launch/default profile (matches run_agent's convention).
             profile_name=Path(profile_home).name if profile_home else None,
+            **project_kwargs,
         )
     except Exception:
         logger.debug("failed to persist desktop session row", exc_info=True)
@@ -4326,7 +4337,8 @@ def _current_profile_name() -> str:
 # v2: adds the file.attach RPC (remote-gateway non-image file upload).
 # v3: adds approvals.mode config RPCs and session.info reconciliation.
 # v4: session.create fast=false is an explicit per-session normal-tier override.
-DESKTOP_BACKEND_CONTRACT = 4
+# v5: session.create pins and validates the explicit Desktop Project identity.
+DESKTOP_BACKEND_CONTRACT = 5
 
 
 def _session_usage_snapshot(session: dict | None) -> dict:
@@ -4423,7 +4435,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "skills": dict(mirror.get("skills") or {}) if isinstance(mirror.get("skills"), dict) else {},
         "cwd": cwd,
         "branch": _git_branch_for_cwd(cwd),
-        "project": _project_info_for_cwd(cwd),
+        "project": (session or {}).get("project_binding") or _project_info_for_cwd(cwd),
         "personality": str(personality or ""),
         "running": bool((session or {}).get("running")),
         "title": _session_live_title(session or {}, session_key) if session_key else "",
@@ -5863,6 +5875,17 @@ def _init_session(
                 with _sessions_lock:
                     if sid in _sessions:
                         _sessions[sid]["cwd"] = row["cwd"]
+                        project_binding = row.get("desktop_project_binding")
+                        if isinstance(project_binding, str) and project_binding:
+                            try:
+                                project_binding = json.loads(project_binding)
+                            except (TypeError, ValueError):
+                                project_binding = None
+                        if isinstance(project_binding, dict):
+                            _sessions[sid]["desktop_project_id"] = row.get(
+                                "desktop_project_id"
+                            )
+                            _sessions[sid]["project_binding"] = project_binding
             else:
                 try:
                     _cwd = _sessions[sid]["cwd"]
@@ -6800,6 +6823,16 @@ def _(rid, params: dict) -> dict:
         explicit_cwd = False
     resolved_cwd = _completion_cwd(params)
     source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+    requested_project_id = str(params.get("project_id") or "").strip() or None
+    resolved_project = _project_info_for_cwd(resolved_cwd)
+    if requested_project_id and (
+        resolved_project is None or resolved_project.get("id") != requested_project_id
+    ):
+        return _err(
+            rid,
+            4091,
+            "Desktop project identity mismatch for the requested session workspace",
+        )
     _enable_gateway_prompts()
 
     # ``profile`` (app-global remote mode): a new chat started under a non-launch
@@ -6870,6 +6903,8 @@ def _(rid, params: dict) -> dict:
             "parent_session_id": parent_session_id,
             "pending_title": title or None,
             "profile_home": str(profile_home) if profile_home is not None else None,
+            "desktop_project_id": requested_project_id,
+            "project_binding": dict(resolved_project) if requested_project_id else None,
             "running": False,
             "session_key": key,
             "show_reasoning": _load_show_reasoning(),
@@ -6921,7 +6956,7 @@ def _(rid, params: dict) -> dict:
                 "skills": {},
                 "cwd": _sessions[sid]["cwd"],
                 "branch": _git_branch_for_cwd(_sessions[sid]["cwd"]),
-                "project": _project_info_for_cwd(_sessions[sid]["cwd"]),
+                "project": dict(resolved_project) if requested_project_id else resolved_project,
                 "lazy": True,
                 "desktop_contract": DESKTOP_BACKEND_CONTRACT,
                 "profile_name": _response_profile_name(profile),

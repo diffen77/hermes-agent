@@ -1155,6 +1155,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     cwd TEXT,
     git_branch TEXT,
     git_repo_root TEXT,
+    desktop_project_id TEXT,
+    desktop_project_binding TEXT,
     billing_provider TEXT,
     billing_base_url TEXT,
     billing_mode TEXT,
@@ -3689,6 +3691,8 @@ class SessionDB:
         cwd: str = None,
         profile_name: str = None,
         git_repo_root: str = None,
+        desktop_project_id: Optional[str] = None,
+        desktop_project_binding: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Insert a session row, enriching NULL metadata on conflict.
 
@@ -3730,9 +3734,10 @@ class SessionDB:
                 """INSERT INTO sessions (
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
                    model, model_config, system_prompt, parent_session_id, cwd,
-                   profile_name, git_repo_root, started_at
+                   profile_name, git_repo_root, desktop_project_id,
+                   desktop_project_binding, started_at
                 )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
                        model_config = COALESCE(sessions.model_config, excluded.model_config),
@@ -3744,7 +3749,9 @@ class SessionDB:
                        parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
                        cwd = COALESCE(sessions.cwd, excluded.cwd),
                        profile_name = COALESCE(sessions.profile_name, excluded.profile_name),
-                       git_repo_root = COALESCE(sessions.git_repo_root, excluded.git_repo_root)""",
+                       git_repo_root = COALESCE(sessions.git_repo_root, excluded.git_repo_root),
+                       desktop_project_id = COALESCE(sessions.desktop_project_id, excluded.desktop_project_id),
+                       desktop_project_binding = COALESCE(sessions.desktop_project_binding, excluded.desktop_project_binding)""",
                 (
                     session_id,
                     source,
@@ -3760,6 +3767,10 @@ class SessionDB:
                     cwd,
                     profile_name,
                     git_repo_root,
+                    desktop_project_id,
+                    json.dumps(desktop_project_binding, sort_keys=True)
+                    if desktop_project_binding
+                    else None,
                     time.time(),
                 ),
             )
