@@ -102,7 +102,11 @@ def project_create(name: str, path: Optional[str] = None, task_id: Optional[str]
     try:
         with pdb.connect_closing() as conn:
             pid = pdb.create_project(conn, name=name, folders=[folder] if folder else [], primary_path=folder or None)
-            pdb.set_active(conn, pid)
+            # A GUI task/session carries its own immutable project/workspace
+            # target. Moving that one session must not retarget the profile's
+            # global active project for other conversations.
+            if task_id is None:
+                pdb.set_active(conn, pid)
             proj = pdb.get_project(conn, pid)
     except ValueError as exc:
         return json.dumps({"success": False, "error": str(exc)})
@@ -123,7 +127,8 @@ def project_switch(project: str, task_id: Optional[str] = None) -> str:
         proj = _resolve(conn, project)
         if proj is None:
             return json.dumps({"success": False, "error": f"no project matching '{project}'"})
-        pdb.set_active(conn, proj.id)
+        if task_id is None:
+            pdb.set_active(conn, proj.id)
 
     primary = _primary_path(proj)
     _apply_workspace(task_id, primary, proj.name)

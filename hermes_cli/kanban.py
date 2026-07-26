@@ -495,6 +495,22 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Provider the model belongs to (worker is spawned with "
              "--provider <name>). Cleared together with the model.",
     )
+    p_probe = sub.add_parser(
+        "probe-specialist",
+        help="Verify and attach live fallback-disabled specialist route evidence",
+    )
+    p_probe.add_argument("task_id")
+    p_probe.add_argument(
+        "--ttl", type=int, default=300,
+        help="Receipt validity in seconds (default 300)",
+    )
+    p_probe_model = sub.add_parser(
+        "probe-model",
+        help="Run an isolated credential-safe exact-route model probe",
+    )
+    p_probe_model.add_argument("--provider", required=True)
+    p_probe_model.add_argument("--model", required=True)
+    p_probe_model.add_argument("--ttl", type=int, default=300)
 
     # --- reclaim / reassign (recovery) ---
     p_reclaim = sub.add_parser(
@@ -1050,6 +1066,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "show":     _cmd_show,
             "assign":   _cmd_assign,
             "set-model": _cmd_set_model,
+            "probe-specialist": _cmd_probe_specialist,
+            "probe-model": _cmd_probe_model,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
@@ -1821,6 +1839,85 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         print(f"Cleared model override on {args.task_id} "
               "(worker uses its profile default)")
     return 0
+
+
+def _cmd_probe_specialist(args: argparse.Namespace) -> int:
+    """Run one exact-route marker inference and persist only safe evidence."""
+    import secrets
+
+    from hermes_cli.specialist_routing import run_live_probe
+
+    if args.ttl <= 0:
+        print("kanban: --ttl must be positive", file=sys.stderr)
+        return 2
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, args.task_id)
+        if task is None:
+            print(f"no such task: {args.task_id}", file=sys.stderr)
+            return 1
+        if not task.specialist_contract:
+            print("kanban: task has no specialist contract", file=sys.stderr)
+            return 2
+        route = task.specialist_contract["selected_route"]
+        active_profile = get_active_profile_name()
+        if active_profile != route["profile"]:
+            print(
+                "kanban: run the probe under the contract profile: "
+                f"hermes -p {route['profile']} kanban probe-specialist {args.task_id}",
+                file=sys.stderr,
+            )
+            return 2
+        receipt = run_live_probe(
+            profile=route["profile"], provider=route["provider"],
+            model=route["model"], nonce=secrets.token_urlsafe(32),
+            ttl_seconds=args.ttl,
+        )
+        if not receipt["model_verified"]:
+            print(json.dumps({
+                "task_id": args.task_id,
+                "model_verified": False,
+                "error_code": receipt["error_code"],
+            }, sort_keys=True), file=sys.stderr)
+            return 2
+        kb.set_specialist_probe_receipt(conn, args.task_id, receipt)
+    print(json.dumps({
+        "task_id": args.task_id,
+        "profile": receipt["profile"],
+        "provider": receipt["provider"],
+        "model": receipt["model"],
+        "model_verified": True,
+        "fallback_disabled": True,
+        "expires_at": receipt["expires_at"],
+        "route_digest": receipt["route_digest"],
+    }, sort_keys=True))
+    return 0
+
+
+def _cmd_probe_model(args: argparse.Namespace) -> int:
+    """Probe a route without creating or mutating a task."""
+    import secrets
+
+    from hermes_cli.specialist_routing import run_live_probe
+
+    profile = get_active_profile_name()
+    if not profile or args.ttl <= 0:
+        print("kanban: active profile and positive --ttl are required", file=sys.stderr)
+        return 2
+    receipt = run_live_probe(
+        profile=profile,
+        provider=args.provider,
+        model=args.model,
+        nonce=secrets.token_urlsafe(32),
+        ttl_seconds=args.ttl,
+    )
+    safe = {key: receipt.get(key) for key in (
+        "receipt_version", "profile", "provider", "model", "route_digest",
+        "marker_digest", "verified_at", "expires_at", "fallback_disabled",
+        "model_verified", "attribution_allowed", "error_code",
+    )}
+    stream = sys.stdout if receipt["model_verified"] else sys.stderr
+    print(json.dumps(safe, sort_keys=True), file=stream)
+    return 0 if receipt["model_verified"] else 2
 
 
 def _cmd_reclaim(args: argparse.Namespace) -> int:

@@ -915,6 +915,9 @@ class Task:
     # model (pre-existing behaviour). Solves the "model from provider A,
     # profile configured for provider B" mismatch class.
     provider_override: Optional[str] = None
+    # Optional task-local role/capability/route/probe contract. JSON in SQLite;
+    # validated immediately before claim so stale proof cannot dispatch.
+    specialist_contract: Optional[dict] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
     # ``max_retries=1`` blocks on the first failure (zero retries),
@@ -1016,6 +1019,11 @@ class Task:
             provider_override=(
                 row["provider_override"]
                 if "provider_override" in keys and row["provider_override"]
+                else None
+            ),
+            specialist_contract=(
+                json.loads(row["specialist_contract"])
+                if "specialist_contract" in keys and row["specialist_contract"]
                 else None
             ),
             max_retries=(
@@ -1186,6 +1194,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- worker resolves the model against the right backend instead of the
     -- profile's configured provider. NULL = profile provider.
     provider_override    TEXT,
+    -- Task-local specialist role/capability/route/probe contract. NULL keeps
+    -- legacy task behavior unchanged.
+    specialist_contract  TEXT,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -2366,6 +2377,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "provider_override", "provider_override TEXT"
         )
 
+    if "specialist_contract" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "specialist_contract", "specialist_contract TEXT"
+        )
+
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
         # default) = classic single-shot worker, preserving the behaviour
@@ -2821,6 +2837,7 @@ def create_task(
     max_retries: Optional[int] = None,
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
+    specialist_contract: Optional[dict] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
@@ -2868,6 +2885,19 @@ def create_task(
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
+    if specialist_contract is not None:
+        if not isinstance(specialist_contract, dict):
+            raise ValueError("specialist_contract must be an object")
+        from hermes_cli.specialist_routing import validate_grok_contract
+
+        validate_grok_contract(
+            specialist_contract, require_fresh=False, require_verified=False
+        )
+        route = specialist_contract["selected_route"]
+        if route["profile"] != assignee:
+            raise ValueError("specialist route profile must match assignee")
+        if route["provider"] != provider_override or route["model"] != model_override:
+            raise ValueError("specialist route must match provider/model overrides")
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -2972,6 +3002,13 @@ def create_task(
                 # Defer the concrete path to the insert loop: it's a fresh
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
+
+    if specialist_contract is not None:
+        contract_project_id = str(specialist_contract.get("project_id") or "").strip()
+        if not project_id or contract_project_id != project_id:
+            raise ValueError(
+                "specialist contract project_id must match a resolved task project"
+            )
 
     parents = tuple(p for p in parents if p)
 
@@ -3120,8 +3157,8 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, specialist_contract
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3146,6 +3183,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        json.dumps(specialist_contract, sort_keys=True) if specialist_contract else None,
                     ),
                 )
                 for pid in parents:
@@ -3170,6 +3208,10 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "specialist_contract_version": (
+                            specialist_contract.get("contract_version")
+                            if specialist_contract else None
+                        ),
                     },
                 )
             return task_id
@@ -3304,20 +3346,7 @@ def set_model_override(
     model: Optional[str],
     provider: Optional[str] = None,
 ) -> bool:
-    """Set (or clear) the per-task model/provider override.
-
-    ``model=None`` (or empty) clears BOTH overrides — the worker falls back
-    to its profile's configured model. ``provider`` without ``model`` is
-    rejected: a bare provider switch has no defined meaning for the worker
-    spawn (``--provider`` alone would re-resolve the profile's model name
-    against a different backend, which is exactly the mismatch class this
-    feature exists to kill).
-
-    Allowed on any non-archived task, including ``running`` ones — the
-    override only takes effect on the NEXT dispatch, so setting it on a
-    running task that's about to be reclaimed/retried is the primary
-    rate-limit-recovery flow. Returns True on success.
-    """
+    """Set (or clear) task model/provider and invalidate stale route proof."""
     model = (model or "").strip() or None
     provider = (provider or "").strip() or None
     if provider and not model:
@@ -3326,19 +3355,65 @@ def set_model_override(
         provider = None
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, specialist_contract FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if not row:
             return False
         if row["status"] == "archived":
             raise RuntimeError(f"cannot set model override on archived task {task_id}")
+        contract_json = row["specialist_contract"]
+        if contract_json:
+            contract = json.loads(contract_json)
+            route = contract["selected_route"]
+            if model != route.get("model") or provider != route.get("provider"):
+                route["model"] = model
+                route["provider"] = provider
+                contract["probe_receipt"] = None
+                contract_json = json.dumps(contract, sort_keys=True)
         conn.execute(
-            "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?",
-            (model, provider, task_id),
+            "UPDATE tasks SET model_override = ?, provider_override = ?, "
+            "specialist_contract = ? WHERE id = ?",
+            (model, provider, contract_json, task_id),
         )
         _append_event(
             conn, task_id, "model_override_set",
             {"model": model, "provider": provider},
+        )
+        return True
+
+
+def set_specialist_probe_receipt(
+    conn: sqlite3.Connection, task_id: str, receipt: dict,
+) -> bool:
+    """Persist a verified, sanitized receipt on the task's exact route."""
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, specialist_contract FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
+        if row["status"] in {"running", "done", "archived"}:
+            raise RuntimeError("specialist probe can only be attached before dispatch")
+        if not row["specialist_contract"]:
+            raise ValueError("task has no specialist contract")
+        contract = json.loads(row["specialist_contract"])
+        contract["probe_receipt"] = dict(receipt)
+        from hermes_cli.specialist_routing import validate_grok_contract
+
+        validate_grok_contract(contract)
+        conn.execute(
+            "UPDATE tasks SET specialist_contract = ? WHERE id = ?",
+            (json.dumps(contract, sort_keys=True), task_id),
+        )
+        safe_keys = (
+            "receipt_version", "profile", "provider", "model",
+            "route_digest", "marker_digest", "verified_at", "expires_at",
+            "fallback_disabled", "model_verified", "attribution_allowed",
+            "error_code",
+        )
+        _append_event(
+            conn, task_id, "specialist_probe_verified",
+            {key: receipt.get(key) for key in safe_keys},
         )
         return True
 
@@ -4023,16 +4098,62 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    now: Optional[int] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
-    now = int(time.time())
+    now = int(time.time()) if now is None else int(now)
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # Read and validate the specialist contract only after acquiring the
+        # write transaction. Probe-receipt refresh uses the same transaction,
+        # so the exact route evidence snapshotted below cannot change between
+        # validation and the ready->running CAS.
+        preclaim = get_task(conn, task_id)
+        route_provenance = None
+        if preclaim and preclaim.specialist_contract:
+            from hermes_cli.specialist_routing import (
+                SpecialistRoutingBlocked,
+                validate_grok_contract,
+            )
+
+            validate_grok_contract(preclaim.specialist_contract, now=now)
+            route = preclaim.specialist_contract["selected_route"]
+            if (
+                preclaim.assignee != route["profile"]
+                or preclaim.provider_override != route["provider"]
+                or preclaim.model_override != route["model"]
+                or preclaim.project_id != preclaim.specialist_contract.get("project_id")
+            ):
+                raise SpecialistRoutingBlocked(
+                    "task dispatch route changed after contract creation"
+                )
+            route_provenance = {
+                "profile": route["profile"],
+                "provider": route["provider"],
+                "model": route["model"],
+                "skills": list(route.get("skills") or []),
+                "toolsets": list(route.get("toolsets") or []),
+                "probe_receipt": dict(preclaim.specialist_contract["probe_receipt"]),
+                "project_id": preclaim.specialist_contract.get("project_id"),
+                "product": preclaim.specialist_contract.get("product"),
+                "scope": preclaim.specialist_contract.get("scope"),
+                "required_roles": list(preclaim.specialist_contract["required_roles"]),
+                "required_capabilities": list(
+                    preclaim.specialist_contract["required_capabilities"]
+                ),
+                "artifact_policy": dict(preclaim.specialist_contract["artifact_policy"]),
+                "content_boundaries": list(
+                    preclaim.specialist_contract.get("content_boundaries") or []
+                ),
+                "prohibited_ownership": list(
+                    preclaim.specialist_contract["prohibited_ownership"]
+                ),
+            }
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4105,8 +4226,8 @@ def claim_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, metadata
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -4116,6 +4237,8 @@ def claim_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                json.dumps({"routing_provenance": route_provenance}, sort_keys=True)
+                if route_provenance else None,
             ),
         )
         run_id = run_cur.lastrowid
@@ -4666,6 +4789,37 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    brain_projection = None
+    task_for_attribution = get_task(conn, task_id)
+    if task_for_attribution and task_for_attribution.specialist_contract:
+        from hermes_cli.specialist_routing import (
+            SpecialistRoutingBlocked,
+            validate_specialist_closure,
+        )
+
+        run_row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?",
+            (task_for_attribution.current_run_id,),
+        ).fetchone() if task_for_attribution.current_run_id else None
+        run_metadata = json.loads(run_row["metadata"] or "{}") if run_row else {}
+        claimed = run_metadata.get("routing_provenance")
+        submitted = metadata.get("routing_provenance") if isinstance(metadata, dict) else None
+        if not isinstance(claimed, dict):
+            raise SpecialistRoutingBlocked("claimed specialist route provenance is missing")
+        if submitted is not None and submitted != claimed:
+            raise SpecialistRoutingBlocked(
+                "completion attribution does not match dispatched route"
+            )
+        metadata = dict(metadata or {})
+        metadata["routing_provenance"] = claimed
+        brain_projection = validate_specialist_closure(
+            contract=task_for_attribution.specialist_contract,
+            provenance=claimed,
+            metadata=metadata,
+            task_id=task_id,
+            run_id=int(task_for_attribution.current_run_id),
+        )
+        metadata["brain_projection"] = brain_projection
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -4698,6 +4852,22 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        if brain_projection is not None:
+            current_task = get_task(conn, task_id)
+            current_run = conn.execute(
+                "SELECT metadata FROM task_runs WHERE id = ?",
+                (current_task.current_run_id,),
+            ).fetchone() if current_task and current_task.current_run_id else None
+            current_metadata = json.loads(current_run["metadata"] or "{}") if current_run else {}
+            if (
+                current_task is None
+                or current_task.specialist_contract is None
+                or current_metadata.get("routing_provenance")
+                != metadata.get("routing_provenance")
+            ):
+                raise SpecialistRoutingBlocked(
+                    "specialist route provenance changed before completion"
+                )
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -4833,6 +5003,7 @@ def complete_task(
         assignee=_done_task.assignee if _done_task else None,
         run_id=run_id,
         summary=(summary if summary is not None else result),
+        brain_projection=brain_projection,
     )
     return True
 
