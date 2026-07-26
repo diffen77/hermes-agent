@@ -68,6 +68,27 @@ class _NoTrigramConnection(sqlite3.Connection):
         return super().cursor(factory or _NoTrigramCursor)
 
 
+def test_session_project_binding_is_persisted_as_explicit_identity(db):
+    binding = {
+        "id": "p_factory",
+        "name": "Hermes Agent",
+        "primary_path": "/repo/hermes-agent",
+        "slug": "hermes-agent",
+    }
+
+    db.create_session(
+        "desktop-project-session",
+        "desktop",
+        cwd="/repo/hermes-agent/.worktrees/task",
+        desktop_project_id="p_factory",
+        desktop_project_binding=binding,
+    )
+
+    row = db.get_session("desktop-project-session")
+    assert row["desktop_project_id"] == "p_factory"
+    assert json.loads(row["desktop_project_binding"]) == binding
+
+
 @pytest.fixture()
 def db(tmp_path):
     """Create a SessionDB with a temp database file."""

@@ -4784,6 +4784,26 @@ def test_desktop_contract_includes_approval_mode_rpc():
     assert server.DESKTOP_BACKEND_CONTRACT >= 3
 
 
+def test_desktop_session_create_rejects_explicit_project_identity_drift(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "_completion_cwd", lambda params=None: str(tmp_path))
+    monkeypatch.setattr(
+        server,
+        "_project_info_for_cwd",
+        lambda cwd: {"id": "p_actual", "slug": "actual", "name": "Actual", "primary_path": str(tmp_path)},
+    )
+
+    response = server.handle_request(
+        {
+            "id": "factory-project-drift",
+            "method": "session.create",
+            "params": {"cwd": str(tmp_path), "project_id": "p_other", "source": "desktop"},
+        }
+    )
+
+    assert response["error"]["code"] == 4091
+    assert "project identity mismatch" in response["error"]["message"]
+
+
 def test_config_set_approval_mode_rejects_unknown_value():
     resp = server.handle_request(
         {

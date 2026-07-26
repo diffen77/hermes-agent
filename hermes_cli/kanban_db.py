@@ -949,6 +949,16 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Opt-in Factory Enforcement Contract. NULL preserves the complete legacy
+    # transition surface; ``factory-v1`` enables the fail-closed guards.
+    enforcement_version: Optional[str] = None
+    project_binding_digest: Optional[str] = None
+    execution_generation: int = 0
+    current_artifact_generation: int = 0
+    artifact_set_digest: Optional[str] = None
+    evidence_set_digest: Optional[str] = None
+    accepted_review_id: Optional[str] = None
+    closure_authorization_id: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1037,6 +1047,47 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            enforcement_version=(
+                row["enforcement_version"]
+                if "enforcement_version" in keys and row["enforcement_version"]
+                else None
+            ),
+            project_binding_digest=(
+                row["project_binding_digest"]
+                if "project_binding_digest" in keys and row["project_binding_digest"]
+                else None
+            ),
+            execution_generation=(
+                int(row["execution_generation"])
+                if "execution_generation" in keys and row["execution_generation"] is not None
+                else 0
+            ),
+            current_artifact_generation=(
+                int(row["current_artifact_generation"])
+                if "current_artifact_generation" in keys
+                and row["current_artifact_generation"] is not None
+                else 0
+            ),
+            artifact_set_digest=(
+                row["artifact_set_digest"]
+                if "artifact_set_digest" in keys and row["artifact_set_digest"]
+                else None
+            ),
+            evidence_set_digest=(
+                row["evidence_set_digest"]
+                if "evidence_set_digest" in keys and row["evidence_set_digest"]
+                else None
+            ),
+            accepted_review_id=(
+                row["accepted_review_id"]
+                if "accepted_review_id" in keys and row["accepted_review_id"]
+                else None
+            ),
+            closure_authorization_id=(
+                row["closure_authorization_id"]
+                if "closure_authorization_id" in keys and row["closure_authorization_id"]
+                else None
             ),
         )
 
@@ -1220,7 +1271,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    enforcement_version TEXT,
+    project_binding_digest TEXT,
+    execution_generation INTEGER NOT NULL DEFAULT 0,
+    current_artifact_generation INTEGER NOT NULL DEFAULT 0,
+    artifact_set_digest TEXT,
+    evidence_set_digest TEXT,
+    accepted_review_id TEXT,
+    closure_authorization_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1291,6 +1350,147 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     uploaded_by  TEXT,
     created_at   INTEGER NOT NULL
 );
+
+-- FEC-1.0 is additive and opt-in. These tables are dormant unless a task has
+-- enforcement_version='factory-v1'.
+CREATE TABLE IF NOT EXISTS factory_task_bindings (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+    version TEXT NOT NULL,
+    desktop_project_id TEXT NOT NULL,
+    board_slug TEXT NOT NULL,
+    repo_root TEXT NOT NULL,
+    git_common_dir TEXT NOT NULL,
+    remote_identity TEXT NOT NULL,
+    workspace_root TEXT NOT NULL,
+    target_ref TEXT NOT NULL,
+    binding_json TEXT NOT NULL,
+    binding_digest TEXT NOT NULL UNIQUE,
+    criterion_set_digest TEXT NOT NULL,
+    writer_profile TEXT NOT NULL,
+    reviewer_profile TEXT NOT NULL,
+    closer_profile TEXT NOT NULL,
+    created_run_id INTEGER,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS factory_authorizations (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    run_id INTEGER NOT NULL UNIQUE REFERENCES task_runs(id),
+    execution_generation INTEGER NOT NULL,
+    profile TEXT NOT NULL,
+    role TEXT NOT NULL,
+    binding_digest TEXT NOT NULL,
+    allowed_effects_json TEXT NOT NULL,
+    issued_by_run_id INTEGER,
+    issued_at INTEGER NOT NULL,
+    revoked_at INTEGER,
+    revoke_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS factory_resource_leases (
+    resource_key TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    run_id INTEGER NOT NULL REFERENCES task_runs(id),
+    authorization_id TEXT NOT NULL REFERENCES factory_authorizations(id),
+    execution_generation INTEGER NOT NULL,
+    binding_digest TEXT NOT NULL,
+    lease_token_hash TEXT NOT NULL,
+    acquired_at INTEGER NOT NULL,
+    heartbeat_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    released_at INTEGER,
+    release_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS factory_artifacts (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    producer_run_id INTEGER NOT NULL REFERENCES task_runs(id),
+    execution_generation INTEGER NOT NULL,
+    artifact_generation INTEGER NOT NULL,
+    binding_digest TEXT NOT NULL,
+    target_ref TEXT NOT NULL,
+    commit_sha TEXT NOT NULL,
+    tree_sha TEXT NOT NULL,
+    diff_base_sha TEXT NOT NULL,
+    diff_or_patch_sha256 TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    manifest_sha256 TEXT NOT NULL UNIQUE,
+    remote_readback_sha TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(task_id, artifact_generation)
+);
+
+CREATE TABLE IF NOT EXISTS factory_evidence (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    run_id INTEGER NOT NULL REFERENCES task_runs(id),
+    artifact_id TEXT NOT NULL REFERENCES factory_artifacts(id),
+    artifact_generation INTEGER NOT NULL,
+    criterion_id TEXT NOT NULL,
+    evidence_type TEXT NOT NULL,
+    subject_digest TEXT NOT NULL,
+    verifier_profile TEXT NOT NULL,
+    verifier_role TEXT NOT NULL,
+    command_or_check TEXT NOT NULL,
+    exit_code INTEGER NOT NULL,
+    output_digest TEXT NOT NULL,
+    immutable_ref TEXT NOT NULL,
+    details_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(run_id, artifact_id, criterion_id, evidence_type, subject_digest)
+);
+
+CREATE TABLE IF NOT EXISTS factory_reviews (
+    id TEXT PRIMARY KEY,
+    review_task_id TEXT NOT NULL REFERENCES tasks(id),
+    review_run_id INTEGER NOT NULL REFERENCES task_runs(id),
+    artifact_id TEXT NOT NULL REFERENCES factory_artifacts(id),
+    artifact_generation INTEGER NOT NULL,
+    artifact_manifest_sha256 TEXT NOT NULL,
+    binding_digest TEXT NOT NULL,
+    reviewer_profile TEXT NOT NULL,
+    reviewer_role TEXT NOT NULL,
+    criterion_set_digest TEXT NOT NULL,
+    evidence_set_digest TEXT NOT NULL,
+    verdict TEXT NOT NULL CHECK (verdict IN ('PASS', 'FAIL')),
+    created_at INTEGER NOT NULL,
+    UNIQUE(review_run_id, artifact_id)
+);
+
+CREATE TRIGGER IF NOT EXISTS factory_task_bindings_no_update
+BEFORE UPDATE ON factory_task_bindings BEGIN
+    SELECT RAISE(ABORT, 'factory_task_bindings is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS factory_task_bindings_no_delete
+BEFORE DELETE ON factory_task_bindings BEGIN
+    SELECT RAISE(ABORT, 'factory_task_bindings is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS factory_artifacts_no_update
+BEFORE UPDATE ON factory_artifacts BEGIN
+    SELECT RAISE(ABORT, 'factory_artifacts is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS factory_artifacts_no_delete
+BEFORE DELETE ON factory_artifacts BEGIN
+    SELECT RAISE(ABORT, 'factory_artifacts is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS factory_evidence_no_update
+BEFORE UPDATE ON factory_evidence BEGIN
+    SELECT RAISE(ABORT, 'factory_evidence is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS factory_evidence_no_delete
+BEFORE DELETE ON factory_evidence BEGIN
+    SELECT RAISE(ABORT, 'factory_evidence is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS factory_reviews_no_update
+BEFORE UPDATE ON factory_reviews BEGIN
+    SELECT RAISE(ABORT, 'factory_reviews is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS factory_reviews_no_delete
+BEFORE DELETE ON factory_reviews BEGIN
+    SELECT RAISE(ABORT, 'factory_reviews is append-only');
+END;
 
 -- Subscription from a gateway source (platform + chat + thread) to a
 -- task. The gateway's kanban-notifier watcher tails task_events and
@@ -2407,6 +2607,39 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    # Factory Enforcement Contract fields are opt-in. Existing rows keep NULL
+    # version/binding and generation zero, preserving every legacy transition.
+    if "enforcement_version" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "enforcement_version", "enforcement_version TEXT"
+        )
+    if "project_binding_digest" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "project_binding_digest", "project_binding_digest TEXT"
+        )
+    if "execution_generation" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "execution_generation",
+            "execution_generation INTEGER NOT NULL DEFAULT 0",
+        )
+    if "current_artifact_generation" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "current_artifact_generation",
+            "current_artifact_generation INTEGER NOT NULL DEFAULT 0",
+        )
+    for column in (
+        "artifact_set_digest",
+        "evidence_set_digest",
+        "accepted_review_id",
+        "closure_authorization_id",
+    ):
+        if column not in cols:
+            _add_column_if_missing(conn, "tasks", column, f"{column} TEXT")
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2802,6 +3035,82 @@ def _claimer_id() -> str:
 # Task creation / mutation
 # ---------------------------------------------------------------------------
 
+FACTORY_ENFORCEMENT_VERSION = "factory-v1"
+FACTORY_CRITERIA = tuple(f"AC-{number:03d}" for number in range(1, 15))
+_FACTORY_BINDING_FIELDS = (
+    "desktop_project_id",
+    "board_slug",
+    "repo_root",
+    "git_common_dir",
+    "remote_identity",
+    "workspace_root",
+    "target_ref",
+    "criterion_set_digest",
+    "writer_profile",
+    "reviewer_profile",
+    "closer_profile",
+)
+
+
+class FactoryEnforcementError(RuntimeError):
+    """A fail-closed FEC-1.0 identity, authority, or evidence denial."""
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _validated_factory_binding(
+    project_binding: Optional[dict],
+    *,
+    project_id: Optional[str],
+    board: Optional[str],
+) -> dict:
+    if not isinstance(project_binding, dict):
+        raise FactoryEnforcementError(
+            "factory-v1 requires an explicit project binding snapshot"
+        )
+    missing = [name for name in _FACTORY_BINDING_FIELDS if not project_binding.get(name)]
+    if missing:
+        raise FactoryEnforcementError(
+            "factory-v1 explicit project binding is missing: " + ", ".join(missing)
+        )
+    normalized = {name: str(project_binding[name]).strip() for name in _FACTORY_BINDING_FIELDS}
+    if normalized["desktop_project_id"] != str(project_id or "").strip():
+        raise FactoryEnforcementError("factory-v1 explicit project binding project mismatch")
+    requested_board = _normalize_board_slug(board or get_current_board()) or DEFAULT_BOARD
+    if _normalize_board_slug(normalized["board_slug"]) != requested_board:
+        raise FactoryEnforcementError("factory-v1 explicit project binding board mismatch")
+    normalized["board_slug"] = requested_board
+    return normalized
+
+
+def _factory_resource_key(resource_type: str, identity: str) -> str:
+    return _sha256_text(f"{resource_type}\0{identity}")
+
+
+def _factory_role_for_profile(binding: sqlite3.Row, profile: Optional[str]) -> Optional[str]:
+    canonical = _canonical_assignee(profile)
+    if canonical == _canonical_assignee(binding["writer_profile"]):
+        return "implementation"
+    if canonical == _canonical_assignee(binding["reviewer_profile"]):
+        return "review"
+    if canonical == _canonical_assignee(binding["closer_profile"]):
+        return "closure"
+    return None
+
+
+def _factory_effects_for_role(role: str) -> list[str]:
+    return {
+        "implementation": ["artifact_publish", "commit", "push", "source_write"],
+        "review": ["evidence", "review"],
+        "closure": ["closure", "evidence"],
+    }[role]
+
 def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     """Lowercase-assignee normalization for Kanban rows (dashboard/CLI parity)."""
     if assignee is None:
@@ -2838,6 +3147,8 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    enforcement_version: Optional[str] = None,
+    project_binding: Optional[dict] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2873,6 +3184,25 @@ def create_task(
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
     """
+    enforcement_version = (enforcement_version or "").strip() or None
+    if enforcement_version not in (None, FACTORY_ENFORCEMENT_VERSION):
+        raise ValueError(
+            f"enforcement_version must be {FACTORY_ENFORCEMENT_VERSION!r} or None"
+        )
+    factory_binding = None
+    if enforcement_version == FACTORY_ENFORCEMENT_VERSION:
+        factory_binding = _validated_factory_binding(
+            project_binding, project_id=project_id, board=board
+        )
+        workspace_kind = "worktree"
+        workspace_path = factory_binding["workspace_root"]
+        target_ref = factory_binding["target_ref"]
+        branch_name = (
+            target_ref.removeprefix("refs/heads/")
+            if target_ref.startswith("refs/heads/")
+            else target_ref
+        )
+
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     if provider_override and not model_override:
@@ -2907,7 +3237,7 @@ def create_task(
     project_repo: Optional[str] = None
     if project_id is not None:
         project_id = str(project_id).strip() or None
-    if project_id:
+    if project_id and factory_binding is None:
         from hermes_cli import projects_db as _pdb
 
         try:
@@ -3046,6 +3376,7 @@ def create_task(
             return row["id"]
 
     now = int(time.time())
+    binding_digest: Optional[str] = None
 
     # Resolve workspace_path from board-level default_workdir when the
     # caller did not specify one explicitly. Board defaults represent
@@ -3130,8 +3461,9 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        enforcement_version, project_binding_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3156,18 +3488,55 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        enforcement_version,
+                        None,
                     ),
                 )
+                if factory_binding is not None:
+                    canonical_binding = dict(factory_binding)
+                    canonical_binding["task_id"] = task_id
+                    binding_json = _canonical_json(canonical_binding)
+                    binding_digest = _sha256_text(binding_json)
+                    conn.execute(
+                        """
+                        INSERT INTO factory_task_bindings (
+                            task_id, version, desktop_project_id, board_slug,
+                            repo_root, git_common_dir, remote_identity,
+                            workspace_root, target_ref, binding_json,
+                            binding_digest, criterion_set_digest,
+                            writer_profile, reviewer_profile, closer_profile,
+                            created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            task_id,
+                            FACTORY_ENFORCEMENT_VERSION,
+                            factory_binding["desktop_project_id"],
+                            factory_binding["board_slug"],
+                            factory_binding["repo_root"],
+                            factory_binding["git_common_dir"],
+                            factory_binding["remote_identity"],
+                            factory_binding["workspace_root"],
+                            factory_binding["target_ref"],
+                            binding_json,
+                            binding_digest,
+                            factory_binding["criterion_set_digest"],
+                            _canonical_assignee(factory_binding["writer_profile"]),
+                            _canonical_assignee(factory_binding["reviewer_profile"]),
+                            _canonical_assignee(factory_binding["closer_profile"]),
+                            now,
+                        ),
+                    )
+                    conn.execute(
+                        "UPDATE tasks SET project_binding_digest=? WHERE id=?",
+                        (binding_digest, task_id),
+                    )
                 for pid in parents:
                     conn.execute(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
                     )
-                _append_event(
-                    conn,
-                    task_id,
-                    "created",
-                    {
+                created_payload = {
                         "assignee": assignee,
                         "status": task_status,
                         "parents": list(parents),
@@ -3180,9 +3549,29 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
-                    },
+                        "enforcement_version": enforcement_version,
+                        "project_binding_digest": (
+                            binding_digest if factory_binding is not None else None
+                        ),
+                    }
+                _append_event(
+                    conn,
+                    task_id,
+                    "created",
+                    created_payload,
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                if factory_binding is not None:
+                    _append_event(
+                        conn,
+                        task_id,
+                        "factory_identity_bound",
+                        {
+                            "version": FACTORY_ENFORCEMENT_VERSION,
+                            "binding_digest": binding_digest,
+                            "desktop_project_id": factory_binding["desktop_project_id"],
+                        },
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -3848,6 +4237,36 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    factory = conn.execute(
+        "SELECT enforcement_version, execution_generation, project_binding_digest "
+        "FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if factory and factory["enforcement_version"] == FACTORY_ENFORCEMENT_VERSION:
+        conn.execute(
+            "UPDATE factory_authorizations SET revoked_at=?, revoke_reason=? "
+            "WHERE task_id=? AND run_id=? AND revoked_at IS NULL",
+            (now, outcome, task_id, run_id),
+        )
+        conn.execute(
+            "UPDATE factory_resource_leases SET released_at=?, release_reason=? "
+            "WHERE task_id=? AND run_id=? AND released_at IS NULL",
+            (now, outcome, task_id, run_id),
+        )
+        _append_event(
+            conn, task_id, "factory_authorization_revoked",
+            {
+                "generation": int(factory["execution_generation"] or 0),
+                "binding_digest": factory["project_binding_digest"],
+                "reason": outcome,
+            },
+            run_id=run_id,
+        )
+        _append_event(
+            conn, task_id, "factory_lease_released",
+            {"generation": int(factory["execution_generation"] or 0), "reason": outcome},
+            run_id=run_id,
+        )
     conn.execute(
         """
         UPDATE task_runs
@@ -4082,6 +4501,23 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    enforced = conn.execute(
+        "SELECT enforcement_version, assignee FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    if enforced and enforced["enforcement_version"] == FACTORY_ENFORCEMENT_VERSION:
+        binding = conn.execute(
+            "SELECT * FROM factory_task_bindings WHERE task_id=?", (task_id,)
+        ).fetchone()
+        role = _factory_role_for_profile(binding, enforced["assignee"]) if binding else None
+        if binding is None or role != "implementation":
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "factory_authority_denied",
+                    {"reason": "role_mismatch", "profile": enforced["assignee"]},
+                )
+            raise FactoryEnforcementError("factory-v1 role authority denied for claim")
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -4146,10 +4582,11 @@ def claim_task(
         )
         if cur.rowcount != 1:
             return None
-        # Look up the current task row so we can populate the run with
-        # its assignee / step / runtime cap.
+        # Look up the current task row so we can populate the run and, for an
+        # enforced task, issue authority against its exact prior generation.
         trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
+            "SELECT assignee, max_runtime_seconds, current_step_key, "
+            "       enforcement_version, project_binding_digest, execution_generation "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -4172,10 +4609,113 @@ def claim_task(
             ),
         )
         run_id = run_cur.lastrowid
-        conn.execute(
-            "UPDATE tasks SET current_run_id = ? WHERE id = ?",
-            (run_id, task_id),
-        )
+        if trow and trow["enforcement_version"] == FACTORY_ENFORCEMENT_VERSION:
+            generation = int(trow["execution_generation"] or 0) + 1
+            conn.execute(
+                "UPDATE tasks SET current_run_id=?, execution_generation=? WHERE id=?",
+                (run_id, generation, task_id),
+            )
+            binding = conn.execute(
+                "SELECT * FROM factory_task_bindings WHERE task_id=?", (task_id,)
+            ).fetchone()
+            if binding is None or binding["binding_digest"] != trow["project_binding_digest"]:
+                raise FactoryEnforcementError("factory-v1 project binding drift denied")
+            role = _factory_role_for_profile(binding, trow["assignee"])
+            if role != "implementation":
+                raise FactoryEnforcementError("factory-v1 role authority denied for claim")
+            authorization_id = "fa_" + secrets.token_hex(12)
+            effects = _factory_effects_for_role(role)
+            conn.execute(
+                """
+                INSERT INTO factory_authorizations (
+                    id, task_id, run_id, execution_generation, profile, role,
+                    binding_digest, allowed_effects_json, issued_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    authorization_id, task_id, run_id, generation,
+                    _canonical_assignee(trow["assignee"]), role,
+                    binding["binding_digest"], _canonical_json(effects), now,
+                ),
+            )
+            for resource_type, identity in (
+                ("source", binding["workspace_root"]),
+                ("git-ref", f"{binding['git_common_dir']}\0{binding['target_ref']}"),
+            ):
+                lease_cur = conn.execute(
+                    """
+                    INSERT INTO factory_resource_leases (
+                        resource_key, task_id, run_id, authorization_id,
+                        execution_generation, binding_digest, lease_token_hash,
+                        acquired_at, heartbeat_at, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(resource_key) DO UPDATE SET
+                        task_id=excluded.task_id,
+                        run_id=excluded.run_id,
+                        authorization_id=excluded.authorization_id,
+                        execution_generation=excluded.execution_generation,
+                        binding_digest=excluded.binding_digest,
+                        lease_token_hash=excluded.lease_token_hash,
+                        acquired_at=excluded.acquired_at,
+                        heartbeat_at=excluded.heartbeat_at,
+                        expires_at=excluded.expires_at,
+                        released_at=NULL,
+                        release_reason=NULL
+                    WHERE factory_resource_leases.released_at IS NOT NULL
+                       OR factory_resource_leases.expires_at < excluded.acquired_at
+                    """,
+                    (
+                        _factory_resource_key(resource_type, identity), task_id,
+                        run_id, authorization_id, generation,
+                        binding["binding_digest"],
+                        _sha256_text(secrets.token_hex(32)), now, now, expires,
+                    ),
+                )
+                if lease_cur.rowcount != 1:
+                    conn.execute(
+                        "DELETE FROM factory_resource_leases WHERE authorization_id=?",
+                        (authorization_id,),
+                    )
+                    conn.execute(
+                        "DELETE FROM factory_authorizations WHERE id=?",
+                        (authorization_id,),
+                    )
+                    conn.execute(
+                        "UPDATE task_runs SET status='rejected', outcome='lease_conflict', "
+                        "ended_at=?, claim_lock=NULL, claim_expires=NULL WHERE id=?",
+                        (now, run_id),
+                    )
+                    conn.execute(
+                        "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, "
+                        "current_run_id=NULL, execution_generation=? WHERE id=?",
+                        (generation - 1, task_id),
+                    )
+                    _append_event(
+                        conn, task_id, "factory_lease_conflict",
+                        {"resource_type": resource_type, "generation": generation},
+                        run_id=run_id,
+                    )
+                    return None
+            _append_event(
+                conn, task_id, "factory_authorized",
+                {
+                    "authorization_id": authorization_id,
+                    "generation": generation,
+                    "role": role,
+                    "binding_digest": binding["binding_digest"],
+                },
+                run_id=run_id,
+            )
+            _append_event(
+                conn, task_id, "factory_lease_acquired",
+                {"generation": generation, "resource_count": 2},
+                run_id=run_id,
+            )
+        else:
+            conn.execute(
+                "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+                (run_id, task_id),
+            )
         _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id},
@@ -4273,15 +4813,73 @@ def heartbeat_claim(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    expected_generation: Optional[int] = None,
+    authorization_id: Optional[str] = None,
 ) -> bool:
-    """Extend a running claim.  Returns True if we still own it.
-
-    Workers that know they'll exceed 15 minutes should call this every
-    few minutes to keep ownership.
-    """
-    expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
+    """Extend a claim and, for FEC tasks, its exact authorization leases."""
+    now = int(time.time())
+    expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     lock = claimer or _claimer_id()
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, claim_lock, current_run_id, enforcement_version, "
+            "execution_generation, project_binding_digest FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if row and row["enforcement_version"] == FACTORY_ENFORCEMENT_VERSION:
+            auth = conn.execute(
+                "SELECT * FROM factory_authorizations WHERE id=? AND task_id=?",
+                (authorization_id, task_id),
+            ).fetchone() if authorization_id else None
+            exact = bool(
+                row["status"] == "running"
+                and row["claim_lock"] == lock
+                and expected_run_id is not None
+                and int(row["current_run_id"] or 0) == int(expected_run_id)
+                and expected_generation is not None
+                and int(row["execution_generation"] or 0) == int(expected_generation)
+                and auth is not None
+                and int(auth["run_id"]) == int(expected_run_id)
+                and int(auth["execution_generation"]) == int(expected_generation)
+                and auth["binding_digest"] == row["project_binding_digest"]
+                and auth["revoked_at"] is None
+            )
+            if not exact:
+                _append_event(
+                    conn, task_id, "factory_stale_callback_denied",
+                    {
+                        "operation": "heartbeat",
+                        "expected_run_id": expected_run_id,
+                        "expected_generation": expected_generation,
+                    },
+                    run_id=expected_run_id,
+                )
+                return False
+            cur = conn.execute(
+                "UPDATE tasks SET claim_expires=?, last_heartbeat_at=? "
+                "WHERE id=? AND current_run_id=? AND execution_generation=?",
+                (expires, now, task_id, expected_run_id, expected_generation),
+            )
+            if cur.rowcount != 1:
+                return False
+            conn.execute(
+                "UPDATE task_runs SET claim_expires=?, last_heartbeat_at=? WHERE id=?",
+                (expires, now, expected_run_id),
+            )
+            lease_cur = conn.execute(
+                "UPDATE factory_resource_leases SET heartbeat_at=?, expires_at=? "
+                "WHERE task_id=? AND run_id=? AND authorization_id=? "
+                "AND execution_generation=? AND released_at IS NULL",
+                (
+                    now, expires, task_id, expected_run_id, authorization_id,
+                    expected_generation,
+                ),
+            )
+            if lease_cur.rowcount != 2:
+                raise FactoryEnforcementError("factory-v1 lease set drift denied")
+            return True
+
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
             "WHERE id = ? AND status = 'running' AND claim_lock = ?",
@@ -4676,6 +5274,478 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+def _require_factory_authorization(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: int,
+    generation: int,
+    authorization_id: str,
+    effect: str,
+) -> tuple[sqlite3.Row, sqlite3.Row]:
+    task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    auth = conn.execute(
+        "SELECT * FROM factory_authorizations WHERE id=? AND task_id=?",
+        (authorization_id, task_id),
+    ).fetchone()
+    exact = bool(
+        task is not None
+        and task["enforcement_version"] == FACTORY_ENFORCEMENT_VERSION
+        and int(task["current_run_id"] or 0) == int(run_id)
+        and int(task["execution_generation"] or 0) == int(generation)
+        and auth is not None
+        and int(auth["run_id"]) == int(run_id)
+        and int(auth["execution_generation"]) == int(generation)
+        and auth["binding_digest"] == task["project_binding_digest"]
+        and auth["revoked_at"] is None
+        and effect in json.loads(auth["allowed_effects_json"])
+    )
+    if not exact:
+        raise FactoryEnforcementError(
+            f"factory-v1 stale or unauthorized {effect} callback denied"
+        )
+    assert task is not None and auth is not None
+    return task, auth
+
+
+def authorize_factory_effect(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: int,
+    generation: int,
+    authorization_id: str,
+    binding_digest: str,
+    effect: str,
+    function_name: str,
+    function_args: dict,
+) -> bool:
+    """Fail closed before an enforced run performs a mutable tool effect."""
+    task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if not task or task["enforcement_version"] is None:
+        return True
+    denial: Optional[str] = None
+    try:
+        checked_task, _auth = _require_factory_authorization(
+            conn, task_id, run_id=run_id, generation=generation,
+            authorization_id=authorization_id, effect=effect,
+        )
+        if checked_task["project_binding_digest"] != binding_digest:
+            raise FactoryEnforcementError("binding digest mismatch")
+        leases = conn.execute(
+            "SELECT COUNT(*) FROM factory_resource_leases "
+            "WHERE task_id=? AND run_id=? AND authorization_id=? "
+            "AND execution_generation=? AND binding_digest=? "
+            "AND released_at IS NULL AND expires_at>=?",
+            (
+                task_id, run_id, authorization_id, generation,
+                binding_digest, int(time.time()),
+            ),
+        ).fetchone()[0]
+        if effect in ("source_write", "commit", "push") and int(leases) != 2:
+            raise FactoryEnforcementError("active source/git lease set missing")
+        if function_name in ("write_file", "patch"):
+            binding = conn.execute(
+                "SELECT workspace_root FROM factory_task_bindings WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+            raw_path = str(function_args.get("path") or "")
+            candidate = Path(raw_path)
+            if not candidate.is_absolute():
+                candidate = Path(binding["workspace_root"]) / candidate
+            workspace = Path(binding["workspace_root"]).resolve(strict=False)
+            resolved = candidate.resolve(strict=False)
+            if os.path.commonpath((str(workspace), str(resolved))) != str(workspace):
+                raise FactoryEnforcementError("file mutation escapes bound workspace")
+    except (FactoryEnforcementError, ValueError) as exc:
+        denial = str(exc)
+    if denial is not None:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "factory_mutation_denied",
+                {
+                    "function_name": function_name,
+                    "effect": effect,
+                    "reason": denial,
+                    "generation": generation,
+                },
+                run_id=run_id,
+            )
+        raise FactoryEnforcementError(f"factory-v1 mutation denied: {denial}")
+    return True
+
+
+def publish_factory_artifact(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: int,
+    generation: int,
+    authorization_id: str,
+    commit_sha: str,
+    tree_sha: str,
+    diff_base_sha: str,
+    diff_or_patch_sha256: str,
+    remote_readback_sha: str,
+    classified_files: Iterable[str],
+    excluded_files_by_class: dict[str, Iterable[str]],
+) -> str:
+    """Append one exact, remotely-read-back git artifact manifest.
+
+    Callers must classify the delivered source tree and provide every digest
+    explicitly.  No field is inferred from a URI or substituted with an
+    unrelated digest: doing so would let plausible metadata satisfy the
+    immutable-artifact gate without proving the pushed object.
+    """
+    now = int(time.time())
+    artifact_id = "far_" + secrets.token_hex(12)
+    with write_txn(conn):
+        task, _auth = _require_factory_authorization(
+            conn, task_id, run_id=run_id, generation=generation,
+            authorization_id=authorization_id, effect="artifact_publish",
+        )
+        if task["artifact_set_digest"] is not None:
+            raise FactoryEnforcementError("factory-v1 artifact set is already frozen")
+        git_oid = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+        for field_name, value in (
+            ("commit_sha", commit_sha),
+            ("tree_sha", tree_sha),
+            ("diff_base_sha", diff_base_sha),
+            ("remote_readback_sha", remote_readback_sha),
+        ):
+            if not git_oid.fullmatch(str(value or "")):
+                raise ValueError(f"{field_name} must be a lowercase git object id")
+        if not re.fullmatch(r"[0-9a-f]{64}", diff_or_patch_sha256 or ""):
+            raise ValueError("diff_or_patch_sha256 must be a lowercase sha256 digest")
+        if remote_readback_sha != commit_sha:
+            raise FactoryEnforcementError(
+                "factory-v1 remote readback SHA does not match published commit"
+            )
+        classified = sorted({str(path) for path in classified_files if str(path)})
+        if not classified:
+            raise FactoryEnforcementError(
+                "factory-v1 artifact publication requires classified source files"
+            )
+        excluded = {
+            str(category): sorted({str(path) for path in paths if str(path)})
+            for category, paths in sorted(excluded_files_by_class.items())
+        }
+        binding = conn.execute(
+            "SELECT * FROM factory_task_bindings WHERE task_id=?", (task_id,)
+        ).fetchone()
+        artifact_generation = int(task["current_artifact_generation"] or 0) + 1
+        manifest = {
+            "task_id": task_id,
+            "producer_run_id": run_id,
+            "execution_generation": generation,
+            "artifact_generation": artifact_generation,
+            "binding_digest": task["project_binding_digest"],
+            "target_ref": binding["target_ref"],
+            "commit_sha": commit_sha,
+            "tree_sha": tree_sha,
+            "diff_base_sha": diff_base_sha,
+            "diff_or_patch_sha256": diff_or_patch_sha256,
+            "remote_readback_sha": remote_readback_sha,
+            "classified_files": classified,
+            "excluded_files_by_class": excluded,
+        }
+        manifest_json = _canonical_json(manifest)
+        manifest_digest = _sha256_text(manifest_json)
+        conn.execute(
+            """
+            INSERT INTO factory_artifacts (
+                id, task_id, producer_run_id, execution_generation,
+                artifact_generation, binding_digest, target_ref, commit_sha,
+                tree_sha, diff_base_sha, diff_or_patch_sha256, manifest_json,
+                manifest_sha256, remote_readback_sha, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                artifact_id, task_id, run_id, generation, artifact_generation,
+                task["project_binding_digest"], binding["target_ref"], commit_sha,
+                tree_sha, diff_base_sha, diff_or_patch_sha256,
+                manifest_json, manifest_digest,
+                remote_readback_sha, now,
+            ),
+        )
+        conn.execute(
+            "UPDATE tasks SET current_artifact_generation=? WHERE id=?",
+            (artifact_generation, task_id),
+        )
+        _append_event(
+            conn, task_id, "factory_artifact_published",
+            {
+                "artifact_id": artifact_id,
+                "artifact_generation": artifact_generation,
+                "commit_sha": commit_sha,
+                "manifest_sha256": manifest_digest,
+                "remote_readback_sha": remote_readback_sha,
+            },
+            run_id=run_id,
+        )
+    return artifact_id
+
+
+def freeze_factory_artifacts(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: int,
+    generation: int,
+    authorization_id: str,
+) -> str:
+    """Freeze the ordered artifact manifest and return its digest."""
+    now = int(time.time())
+    with write_txn(conn):
+        task, _auth = _require_factory_authorization(
+            conn, task_id, run_id=run_id, generation=generation,
+            authorization_id=authorization_id, effect="artifact_publish",
+        )
+        if task["artifact_set_digest"]:
+            return str(task["artifact_set_digest"])
+        artifact = conn.execute(
+            "SELECT * FROM factory_artifacts WHERE task_id=? "
+            "ORDER BY artifact_generation DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        if not artifact:
+            raise FactoryEnforcementError("factory-v1 cannot freeze an empty artifact set")
+        set_digest = str(artifact["manifest_sha256"])
+        conn.execute(
+            "UPDATE tasks SET artifact_set_digest=? WHERE id=?",
+            (set_digest, task_id),
+        )
+        _append_event(
+            conn, task_id, "factory_artifacts_frozen",
+            {
+                "artifact_set_digest": set_digest,
+                "artifact_id": artifact["id"],
+                "artifact_generation": artifact["artifact_generation"],
+            },
+            run_id=run_id,
+        )
+        return set_digest
+
+
+def submit_factory_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: int,
+    generation: int,
+    authorization_id: str,
+    criterion_id: str,
+    evidence_type: str,
+    source_uri: str,
+    digest: str,
+) -> str:
+    """Append one criterion evidence record tied to the frozen artifact set."""
+    if criterion_id not in FACTORY_CRITERIA:
+        raise ValueError(f"unknown factory criterion {criterion_id!r}")
+    if not re.fullmatch(r"[0-9a-f]{64}", digest or ""):
+        raise ValueError("evidence digest must be a lowercase sha256 hex digest")
+    evidence_id = "fev_" + secrets.token_hex(12)
+    now = int(time.time())
+    with write_txn(conn):
+        task, _auth = _require_factory_authorization(
+            conn, task_id, run_id=run_id, generation=generation,
+            authorization_id=authorization_id, effect="artifact_publish",
+        )
+        if not task["artifact_set_digest"]:
+            raise FactoryEnforcementError("factory-v1 evidence requires frozen artifacts")
+        artifact = conn.execute(
+            "SELECT * FROM factory_artifacts WHERE task_id=? "
+            "ORDER BY artifact_generation DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO factory_evidence (
+                id, task_id, run_id, artifact_id, artifact_generation,
+                criterion_id, evidence_type, subject_digest, verifier_profile,
+                verifier_role, command_or_check, exit_code, output_digest,
+                immutable_ref, details_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                evidence_id, task_id, run_id, artifact["id"],
+                artifact["artifact_generation"], criterion_id, evidence_type,
+                artifact["manifest_sha256"], _auth["profile"], _auth["role"],
+                source_uri, 0, digest, source_uri,
+                _canonical_json({"authorization_id": authorization_id, "generation": generation}),
+                now,
+            ),
+        )
+        _append_event(
+            conn, task_id, "factory_evidence_submitted",
+            {"evidence_id": evidence_id, "criterion_id": criterion_id, "digest": digest},
+            run_id=run_id,
+        )
+    return evidence_id
+
+
+def claim_factory_role(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    profile: str,
+    role: str,
+) -> dict:
+    """Issue a generation-fenced review or closure authorization."""
+    if role not in ("review", "closure"):
+        raise ValueError("factory role claim must be 'review' or 'closure'")
+    now = int(time.time())
+    with write_txn(conn):
+        task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        binding = conn.execute(
+            "SELECT * FROM factory_task_bindings WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if not task or not binding or task["enforcement_version"] != FACTORY_ENFORCEMENT_VERSION:
+            raise FactoryEnforcementError("factory-v1 role claim requires an enforced task")
+        if _factory_role_for_profile(binding, profile) != role:
+            raise FactoryEnforcementError("factory-v1 role authority denied")
+        if not task["artifact_set_digest"]:
+            raise FactoryEnforcementError("factory-v1 role claim requires frozen artifacts")
+        evidence_count = conn.execute(
+            "SELECT COUNT(DISTINCT criterion_id) FROM factory_evidence WHERE task_id=?",
+            (task_id,),
+        ).fetchone()[0]
+        if int(evidence_count) != len(FACTORY_CRITERIA):
+            raise FactoryEnforcementError("factory-v1 role claim requires complete evidence")
+        if role == "closure" and not task["accepted_review_id"]:
+            raise FactoryEnforcementError("factory-v1 closure requires accepted review")
+        generation = int(task["execution_generation"] or 0) + 1
+        run_cur = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, started_at) "
+            "VALUES (?, ?, 'running', ?)",
+            (task_id, _canonical_assignee(profile), now),
+        )
+        assert run_cur.lastrowid is not None
+        run_id = int(run_cur.lastrowid)
+        authorization_id = "fa_" + secrets.token_hex(12)
+        conn.execute(
+            """
+            INSERT INTO factory_authorizations (
+                id, task_id, run_id, execution_generation, profile, role,
+                binding_digest, allowed_effects_json, issued_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                authorization_id, task_id, run_id, generation,
+                _canonical_assignee(profile), role, task["project_binding_digest"],
+                _canonical_json(_factory_effects_for_role(role)), now,
+            ),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='running', current_run_id=?, "
+            "execution_generation=?, claim_lock=NULL, claim_expires=NULL WHERE id=?",
+            (run_id, generation, task_id),
+        )
+        closure_authorization_id = None
+        if role == "closure":
+            closure_authorization_id = authorization_id
+            conn.execute(
+                "UPDATE tasks SET closure_authorization_id=? WHERE id=?",
+                (closure_authorization_id, task_id),
+            )
+        _append_event(
+            conn, task_id, f"factory_{role}_authorized",
+            {
+                "authorization_id": authorization_id,
+                "closure_authorization_id": closure_authorization_id,
+                "generation": generation,
+                "profile": _canonical_assignee(profile),
+            },
+            run_id=run_id,
+        )
+        return {
+            "authorization_id": authorization_id,
+            "run_id": run_id,
+            "execution_generation": generation,
+            "closure_authorization_id": closure_authorization_id,
+        }
+
+
+def submit_factory_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: int,
+    generation: int,
+    authorization_id: str,
+    reviewer_profile: str,
+    decision: str,
+    notes: Optional[str] = None,
+) -> str:
+    """Record an immutable independent review over exact artifact/evidence sets."""
+    if decision not in ("accepted", "rejected"):
+        raise ValueError("review decision must be 'accepted' or 'rejected'")
+    review_id = "frev_" + secrets.token_hex(12)
+    now = int(time.time())
+    with write_txn(conn):
+        task, auth = _require_factory_authorization(
+            conn, task_id, run_id=run_id, generation=generation,
+            authorization_id=authorization_id, effect="review",
+        )
+        if _canonical_assignee(reviewer_profile) != auth["profile"]:
+            raise FactoryEnforcementError("factory-v1 reviewer identity mismatch")
+        binding = conn.execute(
+            "SELECT * FROM factory_task_bindings WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if auth["profile"] == binding["writer_profile"]:
+            raise FactoryEnforcementError("factory-v1 review must be independent")
+        rows = conn.execute(
+            "SELECT criterion_id, output_digest, immutable_ref FROM factory_evidence "
+            "WHERE task_id=? ORDER BY criterion_id", (task_id,),
+        ).fetchall()
+        if {row["criterion_id"] for row in rows} != set(FACTORY_CRITERIA):
+            raise FactoryEnforcementError("factory-v1 review requires all criterion evidence")
+        manifest_json = _canonical_json([dict(row) for row in rows])
+        evidence_set_digest = _sha256_text(manifest_json)
+        artifact = conn.execute(
+            "SELECT * FROM factory_artifacts WHERE task_id=? "
+            "ORDER BY artifact_generation DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO factory_reviews (
+                id, review_task_id, review_run_id, artifact_id,
+                artifact_generation, artifact_manifest_sha256, binding_digest,
+                reviewer_profile, reviewer_role, criterion_set_digest,
+                evidence_set_digest, verdict, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                review_id, task_id, run_id, artifact["id"],
+                artifact["artifact_generation"], artifact["manifest_sha256"],
+                task["project_binding_digest"], auth["profile"], auth["role"],
+                binding["criterion_set_digest"], evidence_set_digest,
+                "PASS" if decision == "accepted" else "FAIL", now,
+            ),
+        )
+        conn.execute(
+            "UPDATE tasks SET evidence_set_digest=?, accepted_review_id=? WHERE id=?",
+            (evidence_set_digest, review_id if decision == "accepted" else None, task_id),
+        )
+        _append_event(
+            conn, task_id, "factory_review_submitted",
+            {
+                "review_id": review_id,
+                "decision": decision,
+                "artifact_set_digest": task["artifact_set_digest"],
+                "evidence_set_digest": evidence_set_digest,
+            },
+            run_id=run_id,
+        )
+        _end_run(
+            conn, task_id, outcome=f"review_{decision}", status="done",
+            summary=notes,
+        )
+        conn.execute(
+            "UPDATE tasks SET status='blocked', claim_lock=NULL, claim_expires=NULL WHERE id=?",
+            (task_id,),
+        )
+    return review_id
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -4689,6 +5759,8 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    expected_generation: Optional[int] = None,
+    authorization_id: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4719,6 +5791,73 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+
+    factory_task = conn.execute(
+        "SELECT * FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    if factory_task and factory_task["enforcement_version"] == FACTORY_ENFORCEMENT_VERSION:
+        denial: Optional[str] = None
+        try:
+            if expected_run_id is None or expected_generation is None or not authorization_id:
+                raise FactoryEnforcementError("missing exact closure authorization tuple")
+            _task_row, auth = _require_factory_authorization(
+                conn,
+                task_id,
+                run_id=int(expected_run_id),
+                generation=int(expected_generation),
+                authorization_id=authorization_id,
+                effect="closure",
+            )
+            review = conn.execute(
+                "SELECT * FROM factory_reviews "
+                "WHERE id=? AND review_task_id=? AND verdict='PASS'",
+                (factory_task["accepted_review_id"], task_id),
+            ).fetchone()
+            closure = conn.execute(
+                "SELECT * FROM factory_authorizations "
+                "WHERE id=? AND task_id=? AND role='closure' AND revoked_at IS NULL",
+                (factory_task["closure_authorization_id"], task_id),
+            ).fetchone()
+            binding = conn.execute(
+                "SELECT * FROM factory_task_bindings WHERE task_id=?", (task_id,)
+            ).fetchone()
+            evidence_count = conn.execute(
+                "SELECT COUNT(DISTINCT criterion_id) FROM factory_evidence WHERE task_id=?",
+                (task_id,),
+            ).fetchone()[0]
+            if not all(
+                (
+                    factory_task["artifact_set_digest"],
+                    factory_task["evidence_set_digest"],
+                    review,
+                    closure,
+                    binding,
+                )
+            ):
+                raise FactoryEnforcementError("missing frozen artifact/evidence/review records")
+            if int(evidence_count) != len(FACTORY_CRITERIA):
+                raise FactoryEnforcementError("criterion evidence is incomplete")
+            if auth["profile"] != binding["closer_profile"]:
+                raise FactoryEnforcementError("closer identity mismatch")
+            if review["artifact_manifest_sha256"] != factory_task["artifact_set_digest"]:
+                raise FactoryEnforcementError("review artifact set drift")
+            if review["evidence_set_digest"] != factory_task["evidence_set_digest"]:
+                raise FactoryEnforcementError("review evidence set drift")
+
+        except FactoryEnforcementError as exc:
+            denial = str(exc)
+        if denial is not None:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "factory_closure_denied",
+                    {"reason": denial},
+                    run_id=expected_run_id,
+                )
+            raise FactoryEnforcementError(
+                f"factory-v1 closure contract incomplete: {denial}"
+            )
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -8862,6 +10001,18 @@ def _default_spawn(
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    if task.enforcement_version == FACTORY_ENFORCEMENT_VERSION:
+        env["HERMES_FACTORY_EXECUTION_GENERATION"] = str(task.execution_generation)
+        env["HERMES_FACTORY_BINDING_DIGEST"] = str(task.project_binding_digest or "")
+        with connect(board=board) as factory_conn:
+            factory_auth = factory_conn.execute(
+                "SELECT id FROM factory_authorizations "
+                "WHERE task_id=? AND run_id=? AND execution_generation=? "
+                "AND revoked_at IS NULL",
+                (task.id, task.current_run_id, task.execution_generation),
+            ).fetchone()
+        if factory_auth:
+            env["HERMES_FACTORY_AUTHORIZATION_ID"] = factory_auth["id"]
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
     # Goal-loop mode: the worker reads these and wraps its run in the

@@ -15,6 +15,8 @@ import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
+  $projectScope,
+  ALL_PROJECTS,
   beginSessionMutation,
   endSessionMutation,
   resolveNewSessionCwd,
@@ -165,6 +167,7 @@ async function desktopSessionCreateParams(cwd: string): Promise<Record<string, u
     effort: $currentReasoningEffort.get().trim(),
     fast: $currentFastMode.get(),
     model: $currentModel.get().trim(),
+    projectId: $projectScope.get(),
     provider: $currentProvider.get().trim()
   }
 
@@ -175,6 +178,7 @@ async function desktopSessionCreateParams(cwd: string): Promise<Record<string, u
     cols: 96,
     source: 'desktop',
     ...(cwd && { cwd }),
+    ...(selection.projectId !== ALL_PROJECTS ? { project_id: selection.projectId } : {}),
     ...(profile ? { profile } : {}),
     ...(selection.model
       ? { model: selection.model, ...(selection.provider ? { provider: selection.provider } : {}) }

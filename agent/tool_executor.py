@@ -18,6 +18,7 @@ from pathlib import Path
 import logging
 import os
 import random
+import re
 import threading
 import time
 from typing import Any, Optional
@@ -207,6 +208,70 @@ def _cancelled_tool_result(reason: str = "user interrupt") -> str:
         },
         ensure_ascii=False,
     )
+
+
+_FACTORY_MUTATING_TOOLS = frozenset(
+    {
+        "write_file", "patch", "terminal", "process", "execute_code", "computer_use",
+        "browser_click", "browser_type", "browser_press",
+    }
+)
+
+
+def _factory_mutation_block(
+    function_name: str,
+    function_args: dict,
+    effective_task_id: str,
+) -> Optional[str]:
+    """Return a fail-closed FEC denial before any mutable tool dispatch."""
+    if function_name not in _FACTORY_MUTATING_TOOLS:
+        return None
+    task_id = os.getenv("HERMES_KANBAN_TASK", "").strip()
+    if not task_id:
+        return None
+    if effective_task_id and effective_task_id != task_id:
+        return "factory-v1 mutation denied: task scope mismatch"
+    effect = "source_write"
+    if function_name == "terminal":
+        command = str(function_args.get("command") or "")
+        if re.search(r"(?:^|[;&|]\s*)git\s+push(?:\s|$)", command):
+            effect = "push"
+        elif re.search(r"(?:^|[;&|]\s*)git\s+commit(?:\s|$)", command):
+            effect = "commit"
+    try:
+        from hermes_cli import kanban_db as kb
+
+        with kb.connect() as conn:
+            task = kb.get_task(conn, task_id)
+            if task is None or task.enforcement_version is None:
+                return None
+            if function_name == "process":
+                return (
+                    "factory-v1 mutation denied: process lifecycle effects are "
+                    "unsupported without a process-bound factory tuple"
+                )
+            required = {
+                "run_id": os.getenv("HERMES_KANBAN_RUN_ID", "").strip(),
+                "generation": os.getenv("HERMES_FACTORY_EXECUTION_GENERATION", "").strip(),
+                "authorization_id": os.getenv("HERMES_FACTORY_AUTHORIZATION_ID", "").strip(),
+                "binding_digest": os.getenv("HERMES_FACTORY_BINDING_DIGEST", "").strip(),
+            }
+            if not all(required.values()):
+                return "factory-v1 mutation denied: missing run authorization environment"
+            kb.authorize_factory_effect(
+                conn,
+                task_id,
+                run_id=int(required["run_id"]),
+                generation=int(required["generation"]),
+                authorization_id=required["authorization_id"],
+                binding_digest=required["binding_digest"],
+                effect=effect,
+                function_name=function_name,
+                function_args=function_args,
+            )
+    except Exception as exc:
+        return str(exc)
+    return None
 
 
 def _emit_cancelled_terminal_post_tool_call(
@@ -463,6 +528,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # checkpoint state (dedup slot, real snapshots).
         block_result = None
         blocked_by_guardrail = False
+        _factory_block = (
+            _factory_mutation_block(function_name, function_args, effective_task_id)
+            if _ts_scope_block is None else None
+        )
         if _ts_scope_block is not None:
             # Out-of-scope tool_call: reject before hooks/guardrails/dispatch.
             block_result = _ts_scope_block
@@ -476,6 +545,20 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 status="blocked",
                 error_type="tool_scope_block",
                 error_message=_ts_scope_block,
+                middleware_trace=list(middleware_trace),
+            )
+        elif _factory_block is not None:
+            block_result = json.dumps({"error": _factory_block}, ensure_ascii=False)
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=block_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                status="blocked",
+                error_type="factory_enforcement_block",
+                error_message=_factory_block,
                 middleware_trace=list(middleware_trace),
             )
         else:
@@ -1161,6 +1244,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         if _ts_scope_block is not None:
             _block_msg = _ts_scope_block
             _block_error_type = "tool_scope_block"
+        elif (
+            _factory_block := _factory_mutation_block(
+                function_name, function_args, effective_task_id
+            )
+        ) is not None:
+            _block_msg = _factory_block
+            _block_error_type = "factory_enforcement_block"
         else:
             try:
                 from hermes_cli.plugins import resolve_pre_tool_block
