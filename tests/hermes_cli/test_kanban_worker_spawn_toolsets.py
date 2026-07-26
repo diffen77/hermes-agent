@@ -197,3 +197,57 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+def test_specialist_spawn_uses_contract_toolsets_not_mutating_profile_defaults(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "grok-reviewer"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        "platform_toolsets:\n  cli:\n    - terminal\n    - file\n    - browser\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.specialist_routing import GROK_MODEL, build_grok_contract, create_probe_receipt
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4245
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    receipt = create_probe_receipt(
+        profile="grok-reviewer", provider="xai-oauth", model=GROK_MODEL,
+        nonce="spawn-contract", infer=lambda **kwargs: kwargs["expected_marker"],
+    )
+    contract = build_grok_contract(
+        role="contrarian_reviewer", capability="market_reaction",
+        profile="grok-reviewer", provider="xai-oauth", model=GROK_MODEL,
+        project_id="p_design", product="lundin",
+        scope="irreversible_positioning_review", probe_receipt=receipt,
+        skills=["github-code-review"], toolsets=["vision"],
+    )
+    task = _make_task(kb, assignee="grok-reviewer")
+    task.model_override = GROK_MODEL
+    task.provider_override = "xai-oauth"
+    task.skills = ["github-code-review"]
+    task.specialist_contract = contract
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    kb._default_spawn(task, str(workspace))
+
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--toolsets") + 1] == "vision"
+    assert ["--skills", "github-code-review"] == cmd[
+        cmd.index("--skills"):cmd.index("--skills") + 2
+    ]
+    assert "terminal" not in cmd[cmd.index("--toolsets") + 1]
+    assert "file" not in cmd[cmd.index("--toolsets") + 1]

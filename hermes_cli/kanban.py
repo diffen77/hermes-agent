@@ -58,7 +58,7 @@ def _fmt_task_line(t: kb.Task) -> str:
 
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
-    return {
+    result = {
         "id": t.id,
         "title": t.title,
         "body": t.body,
@@ -83,6 +83,25 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
     }
+    if t.specialist_contract:
+        from hermes_cli.specialist_routing import sanitized_specialist_contract
+
+        result["specialist_contract"] = sanitized_specialist_contract(
+            t.specialist_contract
+        )
+    return result
+
+
+def _parse_json_object(value: str) -> dict[str, Any]:
+    """Parse one inline JSON object for closed, validated CLI contracts."""
+
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"invalid JSON: {exc.msg}") from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("value must be a JSON object")
+    return parsed
 
 
 def _run_state_kwargs(args: argparse.Namespace) -> Optional[dict[str, str]]:
@@ -381,6 +400,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Provider the --model belongs to (passed as "
                                "--provider <name> to the worker). Requires "
                                "--model.")
+    p_create.add_argument(
+        "--specialist-contract",
+        type=_parse_json_object,
+        default=None,
+        help="Inline closed specialist routing contract JSON. The contract must "
+             "match --assignee, --model, --provider, --project, and --skill.",
+    )
     p_create.add_argument("--goal", action="store_true", dest="goal_mode",
                           help="Run the worker in a goal loop: after each "
                                "turn a judge checks the response against the "
@@ -1534,6 +1560,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_retries=max_retries,
             model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
+            specialist_contract=getattr(args, "specialist_contract", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
@@ -1765,6 +1792,17 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print()
         print("Body:")
         print(task.body)
+    if task.specialist_contract:
+        from hermes_cli.specialist_routing import sanitized_specialist_contract
+
+        print()
+        print("Binding specialist contract:")
+        print(json.dumps(
+            sanitized_specialist_contract(task.specialist_contract),
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+        ))
     if task.result:
         print()
         print("Result:")

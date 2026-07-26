@@ -154,6 +154,24 @@ def test_probe_receipt_rejects_unknown_fields_before_persistence():
         )
 
 
+def test_contract_rejects_unknown_top_level_and_nested_fields_before_persistence():
+    contract = build_grok_contract(
+        role="creative_director", capability="visual_art_direction",
+        profile="grok-creative", provider="xai-oauth", model=GROK_MODEL,
+        project_id="p_design", product="the-foundry", scope="public_art_direction",
+        probe_receipt=_successful_receipt(),
+    )
+    for path in (("raw_system_prompt",), ("selected_route", "raw_prompt"),
+                 ("artifact_policy", "nonce"), ("artifact_target", "output")):
+        broken = json.loads(json.dumps(contract))
+        target = broken
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = "SENTINEL_RAW_SYSTEM_PROMPT"
+        with pytest.raises(SpecialistRoutingBlocked, match="unsupported"):
+            validate_grok_contract(broken, now=1_001)
+
+
 def test_grok_binding_requires_provider_and_model():
     receipt = _successful_receipt()
     contract = build_grok_contract(
@@ -200,7 +218,7 @@ def test_auth_presence_alone_cannot_verify_model():
         probe_receipt=None,
     )
     contract["auth_present"] = True
-    with pytest.raises(SpecialistRoutingBlocked, match="live probe"):
+    with pytest.raises(SpecialistRoutingBlocked, match="unsupported"):
         validate_grok_contract(contract, now=1_001)
 
 
@@ -332,6 +350,95 @@ def test_claim_snapshots_profile_provider_model_skills_toolsets(conn, project_id
     assert provenance["probe_receipt"]["model_verified"] is True
 
 
+def test_worker_context_surfaces_sanitized_binding_contract(conn, project_id):
+    contract = build_grok_contract(
+        role="creative_director", capability="visual_art_direction",
+        profile="grok-creative", provider="xai-oauth", model=GROK_MODEL,
+        project_id=project_id, product="the-foundry", scope="public_art_direction",
+        probe_receipt=_successful_receipt(), skills=["popular-web-designs"],
+        toolsets=["browser", "vision"],
+    )
+    task_id = kb.create_task(
+        conn, title="Visible contract", assignee="grok-creative",
+        model_override=GROK_MODEL, provider_override="xai-oauth",
+        project_id=project_id, skills=["popular-web-designs"],
+        specialist_contract=contract,
+    )
+    context = kb.build_worker_context(conn, task_id)
+    assert "GROK-SR-1.0" in context
+    assert "visual_art_direction" in context
+    assert "grok-4.5" in context
+    assert "raw_system_prompt" not in context
+    assert "one-use-private-nonce" not in context
+
+
+def test_only_one_task_can_claim_same_mutable_artifact_scope(conn, project_id):
+    tasks = []
+    for title in ("Writer A", "Writer B"):
+        contract = build_grok_contract(
+            role="creative_director", capability="visual_art_direction",
+            profile="grok-creative", provider="xai-oauth", model=GROK_MODEL,
+            project_id=project_id, product="the-foundry", scope="public_art_direction",
+            probe_receipt=_successful_receipt(),
+        )
+        tasks.append(kb.create_task(
+            conn, title=title, assignee="grok-creative", model_override=GROK_MODEL,
+            provider_override="xai-oauth", project_id=project_id,
+            specialist_contract=contract,
+        ))
+    barrier = threading.Barrier(2)
+    outcomes = []
+
+    def claim(task_id):
+        connection = kb.connect()
+        try:
+            barrier.wait()
+            try:
+                outcomes.append((task_id, kb.claim_task(connection, task_id, now=1_001), None))
+            except SpecialistRoutingBlocked as exc:
+                outcomes.append((task_id, None, str(exc)))
+        finally:
+            connection.close()
+
+    workers = [threading.Thread(target=claim, args=(task_id,)) for task_id in tasks]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+    assert sum(result is not None for _, result, _ in outcomes) == 1
+    assert sum("mutable writer" in (error or "") for _, _, error in outcomes) == 1
+    claimed_tasks = [kb.get_task(conn, task_id) for task_id in tasks]
+    assert all(task is not None for task in claimed_tasks)
+    assert sorted(task.status for task in claimed_tasks if task is not None) == ["ready", "running"]
+
+
+def test_reviewer_contract_is_read_only_and_effective_spawn_is_contract_pinned():
+    contract = build_grok_contract(
+        role="contrarian_reviewer", capability="market_reaction",
+        profile="grok-reviewer", provider="xai-oauth", model=GROK_MODEL,
+        project_id="p_design", product="lundin",
+        scope="irreversible_positioning_review",
+        probe_receipt=_successful_receipt(profile="grok-reviewer"),
+        toolsets=["terminal", "file", "kanban"],
+    )
+    with pytest.raises(SpecialistRoutingBlocked, match="read-only"):
+        validate_grok_contract(contract, now=1_001)
+
+    safe = build_grok_contract(
+        role="contrarian_reviewer", capability="market_reaction",
+        profile="grok-reviewer", provider="xai-oauth", model=GROK_MODEL,
+        project_id="p_design", product="lundin",
+        scope="irreversible_positioning_review",
+        probe_receipt=_successful_receipt(profile="grok-reviewer"),
+        skills=["github-code-review"], toolsets=["vision"],
+    )
+    assert routing.effective_specialist_spawn(safe) == {
+        "profile": "grok-reviewer", "provider": "xai-oauth", "model": GROK_MODEL,
+        "skills": ["github-code-review"], "toolsets": ["vision"],
+        "access_mode": "read_only",
+    }
+
+
 def test_concurrent_specialist_claim_creates_one_provenance_snapshot(conn, project_id):
     contract = build_grok_contract(
         role="creative_director", capability="visual_art_direction",
@@ -453,6 +560,12 @@ def test_completion_rejects_attribution_mismatch(conn, project_id):
             "frozen": True,
             "visible_url": "http://127.0.0.1/review.html",
             "viewports": ["desktop", "mobile"],
+            "evidence": {
+                "source_refs": ["https://example.test/source"],
+                "irreversible_positioning_review": True,
+                "risks": ["Positioning may narrow the market."],
+                "recommendation": "Keep the decision reversible until owner approval.",
+            },
         },
     }
     assert kb.complete_task(
@@ -462,6 +575,16 @@ def test_completion_rejects_attribution_mismatch(conn, project_id):
     assert completed.metadata is not None
     assert completed.metadata["routing_provenance"]["model"] == GROK_MODEL
     assert completed.metadata["brain_projection"]["commit_sha"] == "f" * 40
+    projection = completed.metadata["brain_projection"]
+    outbox = conn.execute(
+        "SELECT task_id, run_id, payload FROM specialist_projection_outbox "
+        "WHERE projection_id = ?",
+        (projection["projection_id"],),
+    ).fetchone()
+    assert outbox is not None
+    assert outbox["task_id"] == task_id
+    assert outbox["run_id"] == completed.id
+    assert json.loads(outbox["payload"]) == projection
 
 
 def test_delivery_contract_requires_roles_and_capabilities_not_only_assignee():
@@ -518,6 +641,70 @@ def test_risk_flags_add_only_required_specialists():
     assert required_risk_roles({"data_integration": True, "release": True}) == [
         "data_integration_specialist", "release_e2e_owner",
     ]
+    contract = build_grok_contract(
+        role="creative_director", capability="visual_art_direction",
+        profile="grok-creative", provider="xai-oauth", model=GROK_MODEL,
+        project_id="p_design", product="the-foundry", scope="public_art_direction",
+        probe_receipt=_successful_receipt(), risks={"security": True, "release": True},
+    )
+    validate_grok_contract(contract, now=1_001)
+    assert contract["required_risk_roles"] == ["security_reviewer", "release_e2e_owner"]
+    broken = json.loads(json.dumps(contract))
+    broken["required_risk_roles"] = ["data_integration_specialist"]
+    with pytest.raises(SpecialistRoutingBlocked, match="risk specialist"):
+        validate_grok_contract(broken, now=1_001)
+
+
+@pytest.mark.parametrize(("product", "scope", "evidence"), [
+    ("webblotsen", "three_customer_concepts", {
+        "source_refs": ["https://example.test/a", "https://example.test/b"],
+        "concepts": [
+            {"id": "editorial", "title": "Editorial", "source_ref": "https://example.test/a"},
+            {"id": "cinematic", "title": "Cinematic", "source_ref": "https://example.test/b"},
+            {"id": "utility", "title": "Utility", "source_ref": "https://example.test/a"},
+        ], "risks": ["contrast"], "recommendation": "Test all three.",
+    }),
+    ("webblotsen", "cohort_responsive_critique", {
+        "source_refs": ["https://example.test/a"],
+        "concept_ids": ["editorial", "cinematic", "utility"], "cohort_complete": True,
+        "viewports": ["desktop", "tablet", "mobile"], "risks": ["overflow"],
+        "recommendation": "Keep the responsive cohort together.",
+    }),
+    ("the-foundry", "public_art_direction", {
+        "source_refs": ["https://example.test/a"],
+        "coverage": ["brand", "photo", "type", "motion", "sv_en_tone"],
+        "risks": ["tone"], "recommendation": "Prototype before implementation.",
+    }),
+    ("hbbq", "campaign", {
+        "source_refs": ["https://example.test/a"], "fact_boundaries_ack": True,
+        "protected_copy_unchanged": True, "risks": ["availability"],
+        "recommendation": "Use only verified menu facts.",
+    }),
+    ("mission-control", "owner_view_hierarchy_critique", {
+        "source_refs": ["https://example.test/a"], "five_second_hierarchy": True,
+        "cta_scope_only": True, "risks": ["noise"],
+        "recommendation": "Lead with the owner decision.",
+    }),
+    ("firmalotsen-personal", "onboarding", {
+        "source_refs": ["https://example.test/a"],
+        "exclusions": ["payroll", "law", "pii", "calculation"],
+        "risks": ["scope"], "recommendation": "Keep onboarding operational.",
+    }),
+    ("lundin", "irreversible_positioning_review", {
+        "source_refs": ["https://example.test/a"],
+        "irreversible_positioning_review": True, "risks": ["lock-in"],
+        "recommendation": "Require owner approval.",
+    }),
+])
+def test_product_scope_evidence_matrix_accepts_only_complete_source_backed_output(
+    product, scope, evidence,
+):
+    artifact = {"evidence": evidence}
+    routing.validate_specialist_evidence(product=product, scope=scope, artifact=artifact)
+    broken = json.loads(json.dumps(artifact))
+    broken["evidence"].pop("source_refs")
+    with pytest.raises(SpecialistRoutingBlocked, match="evidence matrix"):
+        routing.validate_specialist_evidence(product=product, scope=scope, artifact=broken)
 
 
 def test_review_pins_exact_non_self_authored_generation():

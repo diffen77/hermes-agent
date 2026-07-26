@@ -420,7 +420,7 @@ def _handle_show(args: dict, **kw) -> str:
             children = kb.child_ids(conn, tid)
 
             def _task_dict(t):
-                return {
+                result = {
                     "id": t.id, "title": t.title, "body": t.body,
                     "assignee": t.assignee, "status": t.status,
                     "tenant": t.tenant, "priority": t.priority,
@@ -434,6 +434,13 @@ def _handle_show(args: dict, **kw) -> str:
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
                 }
+                if t.specialist_contract:
+                    from hermes_cli.specialist_routing import sanitized_specialist_contract
+
+                    result["specialist_contract"] = sanitized_specialist_contract(
+                        t.specialist_contract
+                    )
+                return result
 
             def _run_dict(r):
                 return {

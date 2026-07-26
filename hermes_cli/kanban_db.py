@@ -1286,6 +1286,18 @@ CREATE TABLE IF NOT EXISTS task_runs (
     error               TEXT
 );
 
+-- Durable idempotent outbox for canonical Brain/Neo4j specialist provenance.
+-- An external projector may consume these rows; completion commits the exact
+-- sanitized payload atomically with task closure.
+CREATE TABLE IF NOT EXISTS specialist_projection_outbox (
+    projection_id TEXT PRIMARY KEY,
+    task_id       TEXT NOT NULL,
+    run_id        INTEGER NOT NULL,
+    payload       TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    consumed_at   INTEGER
+);
+
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
 -- this row carries metadata + the absolute ``stored_path`` so the
@@ -1327,6 +1339,8 @@ CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, c
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
+CREATE INDEX IF NOT EXISTS idx_specialist_projection_task
+    ON specialist_projection_outbox(task_id, run_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
@@ -3009,6 +3023,8 @@ def create_task(
             raise ValueError(
                 "specialist contract project_id must match a resolved task project"
             )
+        if skills is None:
+            skills = list(specialist_contract["selected_route"].get("skills") or [])
 
     parents = tuple(p for p in parents if p)
 
@@ -3056,6 +3072,11 @@ def create_task(
                 "capabilities (e.g. `web`, `browser`, `terminal`)."
             )
         skills_list = cleaned
+
+    if specialist_contract is not None:
+        route_skills = list(specialist_contract["selected_route"].get("skills") or [])
+        if (skills_list or []) != route_skills:
+            raise ValueError("task skills must exactly match specialist selected_route")
 
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
@@ -4123,6 +4144,28 @@ def claim_task(
 
             validate_grok_contract(preclaim.specialist_contract, now=now)
             route = preclaim.specialist_contract["selected_route"]
+            artifact_target = preclaim.specialist_contract["artifact_target"]
+            if artifact_target["access_mode"] == "mutable_writer":
+                for active_row in conn.execute(
+                    "SELECT id, specialist_contract FROM tasks "
+                    "WHERE status = 'running' AND id != ? "
+                    "AND specialist_contract IS NOT NULL",
+                    (task_id,),
+                ).fetchall():
+                    try:
+                        active_contract = json.loads(active_row["specialist_contract"])
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    active_target = active_contract.get("artifact_target")
+                    if (
+                        isinstance(active_target, dict)
+                        and active_target.get("access_mode") == "mutable_writer"
+                        and active_target.get("scope_id") == artifact_target["scope_id"]
+                        and active_target.get("generation") == artifact_target["generation"]
+                    ):
+                        raise SpecialistRoutingBlocked(
+                            "another mutable writer owns this artifact scope and generation"
+                        )
             if (
                 preclaim.assignee != route["profile"]
                 or preclaim.provider_override != route["provider"]
@@ -4153,6 +4196,15 @@ def claim_task(
                 "prohibited_ownership": list(
                     preclaim.specialist_contract["prohibited_ownership"]
                 ),
+                "artifact_target": dict(artifact_target),
+                "effective_spawn_config": {
+                    "profile": route["profile"],
+                    "provider": route["provider"],
+                    "model": route["model"],
+                    "skills": list(route.get("skills") or []),
+                    "toolsets": list(route.get("toolsets") or []),
+                    "access_mode": artifact_target["access_mode"],
+                },
             }
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
@@ -4868,6 +4920,23 @@ def complete_task(
                 raise SpecialistRoutingBlocked(
                     "specialist route provenance changed before completion"
                 )
+            projection_json = json.dumps(
+                brain_projection, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            projection_run_id = current_task.current_run_id
+            if projection_run_id is None:
+                raise RuntimeError("specialist projection run identity is missing")
+            conn.execute(
+                "INSERT INTO specialist_projection_outbox "
+                "(projection_id, task_id, run_id, payload, created_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(projection_id) DO UPDATE SET payload = excluded.payload "
+                "WHERE specialist_projection_outbox.payload = excluded.payload",
+                (
+                    brain_projection["projection_id"], task_id,
+                    projection_run_id, projection_json, now,
+                ),
+            )
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -9036,8 +9105,21 @@ def _default_spawn(
     # accepts both forms (action='append' + comma-split), but
     # per-name pairs are easier to read in `ps` output and avoid any
     # quoting ambiguity if a skill name ever contains unusual chars.
-    if task.skills:
-        for sk in task.skills:
+    specialist_spawn = None
+    if task.specialist_contract:
+        from hermes_cli.specialist_routing import effective_specialist_spawn
+
+        specialist_spawn = effective_specialist_spawn(task.specialist_contract)
+        if (
+            specialist_spawn["profile"] != profile_arg
+            or specialist_spawn["provider"] != task.provider_override
+            or specialist_spawn["model"] != task.model_override
+            or specialist_spawn["skills"] != list(task.skills or [])
+        ):
+            raise RuntimeError("specialist effective spawn config drifted from task snapshot")
+    spawn_skills = specialist_spawn["skills"] if specialist_spawn else task.skills
+    if spawn_skills:
+        for sk in spawn_skills:
             if sk:
                 cmd.extend(["--skills", sk])
     if task.model_override:
@@ -9048,7 +9130,11 @@ def _default_spawn(
         # the classic mis-set that stalls a board).
         if task.provider_override:
             cmd.extend(["--provider", task.provider_override])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    worker_toolsets = (
+        specialist_spawn["toolsets"]
+        if specialist_spawn is not None
+        else _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    )
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
@@ -9223,6 +9309,16 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
+
+    if task.specialist_contract:
+        from hermes_cli.specialist_routing import sanitized_specialist_contract
+
+        safe_contract = sanitized_specialist_contract(task.specialist_contract)
+        lines.append("## Binding specialist contract")
+        lines.append("```json")
+        lines.append(_cap(json.dumps(safe_contract, ensure_ascii=False, sort_keys=True)))
+        lines.append("```")
+        lines.append("")
 
     if task.body and task.body.strip():
         lines.append("## Body")
