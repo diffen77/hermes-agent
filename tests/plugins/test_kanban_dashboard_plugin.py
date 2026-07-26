@@ -19,6 +19,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import projects_db as projects_db
+from hermes_cli.specialist_routing import (
+    GROK_MODEL,
+    build_grok_contract,
+    create_probe_receipt,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +119,53 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+def test_dashboard_create_and_read_preserve_sanitized_specialist_contract(
+    client, tmp_path
+):
+    repo = tmp_path / "specialist-project"
+    repo.mkdir()
+    with projects_db.connect_closing() as conn:
+        project_id = projects_db.create_project(
+            conn, name="Specialist Project", folders=[str(repo)],
+            primary_path=str(repo),
+        )
+    receipt = create_probe_receipt(
+        profile="grok-creative", provider="xai-oauth", model=GROK_MODEL,
+        nonce="dashboard-contract", now=1_000,
+        infer=lambda **kwargs: kwargs["expected_marker"],
+    )
+    contract = build_grok_contract(
+        role="creative_director", capability="visual_art_direction",
+        profile="grok-creative", provider="xai-oauth", model=GROK_MODEL,
+        project_id=project_id, product="the-foundry", scope="public_art_direction",
+        probe_receipt=receipt,
+    )
+
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "Specialist design",
+            "assignee": "grok-creative",
+            "project_id": project_id,
+            "model_override": GROK_MODEL,
+            "provider_override": "xai-oauth",
+            "specialist_contract": contract,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    task = response.json()["task"]
+    assert task["project_id"] == project_id
+    assert task["specialist_contract"]["contract_version"] == "GROK-SR-1.0"
+    assert task["specialist_contract"]["selected_route"]["model"] == GROK_MODEL
+    assert "dashboard-contract" not in response.text
+    assert "marker_digest" not in response.text
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["task"]["specialist_contract"] == task["specialist_contract"]
 
 
 def test_board_list_recommends_persistent_workspace_for_configured_workdir(
