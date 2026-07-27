@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+import stat
 import tempfile
 import time
 from collections import Counter, defaultdict
@@ -55,29 +56,97 @@ def _board_paths(root: Path) -> list[tuple[str, Path]]:
     return found
 
 
-def _known_project_ids(root: Path) -> set[str]:
-    ids: set[str] = set()
-    paths = [root / "projects.db"]
+def _profile_directories(root: Path) -> tuple[list[Path], bool]:
     profiles = root / "profiles"
-    if profiles.is_dir():
-        paths.extend(sorted(profiles.glob("*/projects.db")))
+    try:
+        mode = profiles.stat().st_mode
+    except FileNotFoundError:
+        return [], True
+    except OSError:
+        return [], False
+    if not stat.S_ISDIR(mode):
+        return [], False
+    try:
+        entries = sorted(profiles.iterdir(), key=lambda item: item.name)
+    except OSError:
+        return [], False
+
+    directories: list[Path] = []
+    complete = True
+    for entry in entries:
+        try:
+            if stat.S_ISDIR(entry.stat().st_mode):
+                directories.append(entry)
+        except OSError:
+            complete = False
+    return directories, complete
+
+
+def _optional_regular_file(path: Path) -> tuple[bool, bool]:
+    """Return ``(exists_as_file, discovery_complete)`` for an optional file."""
+    try:
+        mode = path.stat().st_mode
+    except FileNotFoundError:
+        return False, True
+    except OSError:
+        return False, False
+    is_file = stat.S_ISREG(mode)
+    return is_file, is_file
+
+
+def _known_profile_names(root: Path) -> tuple[set[str], bool]:
+    names: set[str] = set()
+    complete = True
+    try:
+        root_mode = root.stat().st_mode
+    except FileNotFoundError:
+        root_mode = None
+    except OSError:
+        root_mode = None
+        complete = False
+    if root_mode is not None:
+        if stat.S_ISDIR(root_mode):
+            names.add("default")
+        else:
+            complete = False
+
+    profiles, profiles_complete = _profile_directories(root)
+    complete = complete and profiles_complete
+    for profile in profiles:
+        is_config, config_complete = _optional_regular_file(profile / "config.yaml")
+        complete = complete and config_complete
+        if is_config:
+            names.add(profile.name)
+    return names, complete
+
+
+def _known_project_ids(root: Path) -> tuple[set[str], bool]:
+    ids: set[str] = set()
+    complete = True
+    profiles, profiles_complete = _profile_directories(root)
+    complete = complete and profiles_complete
+    paths = [root / "projects.db", *(profile / "projects.db" for profile in profiles)]
     for path in paths:
-        if not path.is_file():
+        is_registry, registry_complete = _optional_regular_file(path)
+        complete = complete and registry_complete
+        if not is_registry:
             continue
         try:
             with closing(_readonly_connect(path)) as conn:
                 table = conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='projects'"
                 ).fetchone()
-                if table:
-                    ids.update(
-                        str(row[0])
-                        for row in conn.execute("SELECT id FROM projects")
-                        if row[0]
-                    )
+                if not table:
+                    complete = False
+                    continue
+                ids.update(
+                    str(row[0])
+                    for row in conn.execute("SELECT id FROM projects")
+                    if row[0]
+                )
         except sqlite3.Error:
-            continue
-    return ids
+            complete = False
+    return ids, complete
 
 
 def _workspace_family(path_value: object) -> tuple[bool, str | None]:
@@ -106,6 +175,8 @@ def classify_fixture_candidates(
     *,
     known_profiles: set[str],
     known_project_ids: set[str],
+    profiles_complete: bool = True,
+    projects_complete: bool = True,
 ) -> dict[str, tuple[str, ...]]:
     """Return strong fixture families keyed by task id.
 
@@ -114,10 +185,15 @@ def classify_fixture_candidates(
     and belong to a multi-task family with delivery dependency evidence or the
     known Grok review-fixture topology.
     """
-    # Absence can only be proven against positive registry evidence. If either
-    # discovery source is unavailable/empty, classifying a real delivery row as
-    # a fixture would be destructive, so fail closed.
-    if not known_profiles or not known_project_ids:
+    # Absence can only be proven against complete, positive registry evidence.
+    # Partial discovery is not evidence that an omitted profile/project is
+    # absent, so fail closed before examining any task rows.
+    if (
+        not profiles_complete
+        or not projects_complete
+        or not known_profiles
+        or not known_project_ids
+    ):
         return {}
     rows = [dict(row) for row in tasks]
     eligible: dict[str, dict[str, object]] = {}
@@ -228,6 +304,8 @@ def _board_ledger(
     *,
     known_profiles: set[str],
     known_project_ids: set[str],
+    profiles_complete: bool,
+    projects_complete: bool,
     now: int,
     stale_after_seconds: int,
     limit: int,
@@ -255,6 +333,8 @@ def _board_ledger(
         links,
         known_profiles=known_profiles,
         known_project_ids=known_project_ids,
+        profiles_complete=profiles_complete,
+        projects_complete=projects_complete,
     )
     counts = dict(sorted(Counter(str(row["status"]) for row in tasks).items()))
     running: list[dict[str, object]] = []
@@ -332,9 +412,13 @@ def build_fleet_ledger(
     """Build a bounded, deterministic, read-only fleet projection."""
     root = (root or kb.kanban_home()).expanduser().resolve()
     if known_profiles is None:
-        known_profiles = set(kb.list_profiles_on_disk())
+        known_profiles, profiles_complete = _known_profile_names(root)
+    else:
+        profiles_complete = True
     if known_project_ids is None:
-        known_project_ids = _known_project_ids(root)
+        known_project_ids, projects_complete = _known_project_ids(root)
+    else:
+        projects_complete = True
     now = int(time.time()) if now is None else int(now)
     limit = max(1, min(int(limit), 100))
     boards = [
@@ -343,6 +427,8 @@ def build_fleet_ledger(
             path,
             known_profiles=set(known_profiles),
             known_project_ids=set(known_project_ids),
+            profiles_complete=profiles_complete,
+            projects_complete=projects_complete,
             now=now,
             stale_after_seconds=max(1, int(stale_after_seconds)),
             limit=limit,

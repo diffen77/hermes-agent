@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -208,6 +209,91 @@ def test_fixture_classifier_preserves_known_p102_delivery_rows(tmp_path: Path) -
         links,
         known_profiles={"john", "raffe", "janne"},
         known_project_ids={"p_102c8528"},
+    ) == {}
+
+
+def test_mixed_project_registry_failure_cannot_establish_project_absence(
+    tmp_path: Path,
+) -> None:
+    from hermes_cli.kanban_fleet import _known_project_ids, classify_fixture_candidates
+
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    with sqlite3.connect(root / "projects.db") as conn:
+        conn.execute("CREATE TABLE projects (id TEXT PRIMARY KEY)")
+        conn.execute("INSERT INTO projects (id) VALUES ('p_other')")
+    lost_registry = root / "profiles" / "lost" / "projects.db"
+    lost_registry.parent.mkdir(parents=True)
+    lost_registry.write_bytes(b"not a sqlite database")
+    rows, links = _delivery_fixture_rows(tmp_path, "p_102c8528")
+
+    project_ids, projects_complete = _known_project_ids(root)
+
+    assert project_ids == {"p_other"}
+    assert projects_complete is False
+    assert classify_fixture_candidates(
+        rows,
+        links,
+        known_profiles={"john", "raffe", "janne"},
+        known_project_ids=project_ids,
+        projects_complete=projects_complete,
+    ) == {}
+
+
+def test_mixed_profile_discovery_failure_cannot_establish_profile_absence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from hermes_cli.kanban_fleet import _known_profile_names, classify_fixture_candidates
+
+    root = tmp_path / ".hermes"
+    healthy_config = root / "profiles" / "john" / "config.yaml"
+    healthy_config.parent.mkdir(parents=True)
+    healthy_config.write_text("model: {}\n")
+    lost_config = root / "profiles" / "lost" / "config.yaml"
+    lost_config.parent.mkdir(parents=True)
+    lost_config.write_text("model: {}\n")
+    original_stat = Path.stat
+
+    def partial_stat(path: Path, *args, **kwargs):
+        if path == lost_config:
+            raise PermissionError("profile config is unreadable")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", partial_stat)
+    rows, links = _delivery_fixture_rows(tmp_path, "p_102c8528")
+
+    profile_names, profiles_complete = _known_profile_names(root)
+
+    assert profile_names == {"default", "john"}
+    assert profiles_complete is False
+    assert classify_fixture_candidates(
+        rows,
+        links,
+        known_profiles=profile_names,
+        known_project_ids={"p_other"},
+        profiles_complete=profiles_complete,
+    ) == {}
+
+
+def test_empty_project_registry_discovery_is_complete_but_fails_closed(
+    tmp_path: Path,
+) -> None:
+    from hermes_cli.kanban_fleet import _known_project_ids, classify_fixture_candidates
+
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    rows, links = _delivery_fixture_rows(tmp_path, "p_102c8528")
+
+    project_ids, projects_complete = _known_project_ids(root)
+
+    assert project_ids == set()
+    assert projects_complete is True
+    assert classify_fixture_candidates(
+        rows,
+        links,
+        known_profiles={"john", "raffe", "janne"},
+        known_project_ids=project_ids,
+        projects_complete=projects_complete,
     ) == {}
 
 
