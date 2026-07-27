@@ -11,11 +11,12 @@ import { compactNumber } from '@/lib/format'
 import { AlertCircle, CheckCircle2 } from '@/lib/icons'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
+import { $focusedRuntimeId } from '@/store/session-states'
 import {
   $subagentsBySession,
-  allSubagents,
   buildSubagentTree,
   type SubagentNode,
+  subagentsForSession,
   type SubagentStatus,
   type SubagentStreamEntry
 } from '@/store/subagents'
@@ -79,12 +80,13 @@ interface AgentsViewProps {
 
 export function AgentsView({ onClose }: AgentsViewProps) {
   const { t } = useI18n()
+  const focusedRuntimeId = useStore($focusedRuntimeId)
   const subagentsBySession = useStore($subagentsBySession)
 
-  // Aggregate every session, matching the status-bar indicator — a subagent
-  // running in a background session must still be visible here, or the two
-  // desync ("Agents N running" vs an empty tree).
-  const tree = useMemo(() => buildSubagentTree(allSubagents(subagentsBySession)), [subagentsBySession])
+  const tree = useMemo(
+    () => buildSubagentTree(subagentsForSession(subagentsBySession, focusedRuntimeId)),
+    [focusedRuntimeId, subagentsBySession]
+  )
 
   return (
     <Panel closeLabel={t.agents.close} onClose={onClose}>

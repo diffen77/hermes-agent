@@ -291,6 +291,10 @@ export const activeSubagentCount = (items: readonly SubagentProgress[]) =>
 export const failedSubagentCount = (items: readonly SubagentProgress[]) =>
   items.filter(item => item.status === 'failed' || item.status === 'interrupted').length
 
-/** Flatten every session's subagents — the scope the Spawn-tree panel and the
- *  status-bar indicator must agree on. */
-export const allSubagents = (bySession: Record<string, SubagentProgress[]>) => Object.values(bySession).flat()
+/** Select the subagents owned by one resolved live runtime session. A missing
+ * runtime intentionally yields an empty scope instead of exposing cached rows
+ * from unrelated sessions. */
+export const subagentsForSession = (
+  bySession: Record<string, SubagentProgress[]>,
+  sessionId: null | string
+): readonly SubagentProgress[] => (sessionId ? (bySession[sessionId] ?? []) : [])

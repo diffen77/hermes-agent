@@ -32,7 +32,12 @@ import {
   setCurrentUsage
 } from '@/store/session'
 import { $focusedRuntimeId, $focusedSessionState, $focusedStoredSessionId } from '@/store/session-states'
-import { $subagentsBySession, activeSubagentCount, failedSubagentCount } from '@/store/subagents'
+import {
+  $subagentsBySession,
+  activeSubagentCount,
+  failedSubagentCount,
+  subagentsForSession
+} from '@/store/subagents'
 import { $gatewayRestarting } from '@/store/system-actions'
 import {
   $backendUpdateApply,
@@ -105,19 +110,6 @@ export function useStatusbarItems({
   const primarySessionStartedAt = useStore($sessionStartedAt)
   const primaryTurnStartedAt = useStore($turnStartedAt)
 
-  // The indicator must speak the same scope as the Spawn-tree panel it opens:
-  // every session's subagents, never background system actions. Only two
-  // COUNTS are read, so select scalars — a whole-map `useStore` re-ran this
-  // hook (rebuilding all ~9 statusbar items) on every subagent progress tick
-  // in ANY session, including background ones.
-  const subagentsRunning = useStoreSelector($subagentsBySession, bySession =>
-    Object.values(bySession).reduce((sum, items) => sum + activeSubagentCount(items), 0)
-  )
-
-  const subagentsFailed = useStoreSelector($subagentsBySession, bySession =>
-    Object.values(bySession).reduce((sum, items) => sum + failedSubagentCount(items), 0)
-  )
-
   const updateStatus = useStore($updateStatus)
   const updateApply = useStore($updateApply)
   const backendUpdateStatus = useStore($backendUpdateStatus)
@@ -131,6 +123,18 @@ export function useStatusbarItems({
   // tile makes the statusbar describe THAT session.
   const focusedStoredSessionId = useStore($focusedStoredSessionId)
   const focusedRuntimeId = useStore($focusedRuntimeId)
+
+  // The indicator and the Spawn-tree panel both select through the same
+  // focused runtime id and session-scoping helper. Scalar selectors preserve
+  // the statusbar's no-op bailout on high-frequency progress updates.
+  const subagentsRunning = useStoreSelector($subagentsBySession, bySession =>
+    activeSubagentCount(subagentsForSession(bySession, focusedRuntimeId))
+  )
+
+  const subagentsFailed = useStoreSelector($subagentsBySession, bySession =>
+    failedSubagentCount(subagentsForSession(bySession, focusedRuntimeId))
+  )
+
   // `$focusedSessionState` is a projection of `$sessionStates`, which is
   // republished on EVERY message delta — tens of times a second during a turn.
   // Only three fields are read off it here, so subscribing to the whole object
