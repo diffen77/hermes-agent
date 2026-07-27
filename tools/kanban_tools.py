@@ -1163,7 +1163,12 @@ def _handle_create(args: dict, **kw) -> str:
     workspace_path = args.get("workspace_path")
     project_id = args.get("project") or args.get("project_id")
     project_source_task_id = None
-    _inherit_project = workspace_kind is None and workspace_path is None
+    # Project identity is durable routing ownership, independent of the
+    # execution workspace a worker requests for its follow-up.  Inherit it
+    # whenever the caller did not explicitly choose a project; tying this to
+    # omitted workspace fields detached otherwise-valid remediation/review
+    # cards from their Desktop Project.
+    _inherit_project = project_id is None
     if workspace_kind is None:
         workspace_kind = "scratch"
     triage, bool_error = _parse_bool_arg(args, "triage")
