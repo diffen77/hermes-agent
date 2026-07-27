@@ -1002,8 +1002,19 @@ def apply_safe_recovery(
     paths_by_slug = {slug: path for slug, path in board_paths}
     results: list[dict[str, object]] = []
     ledger_boards = cast(list[dict[str, object]], ledger["boards"])
+    recovery_budget_consumed = False
     for board in ledger_boards:
         slug = str(board["slug"])
+        if recovery_budget_consumed:
+            results.append(
+                {
+                    "board": slug,
+                    "outcome": "budget_deferred",
+                    "mutations": 0,
+                    "remaining_candidates": board["fixture_candidates"],
+                }
+            )
+            continue
         path = paths_by_slug.get(slug)
         if path is None:
             results.append({"board": slug, "outcome": "cas_mismatch", "mutations": 0})
@@ -1023,18 +1034,24 @@ def apply_safe_recovery(
                 {"board": slug, "outcome": "authority_cas_mismatch", "mutations": 0}
             )
             continue
-        results.append(
-            _apply_board_fixture_quarantine(
-                root=root,
-                slug=slug,
-                path=path,
-                expected_generation=str(
-                    cast(dict[str, object], board["snapshot"])["generation"]
-                ),
-                known_profiles=fresh_profiles,
-                known_project_ids=fresh_projects,
-                now=now,
-            )
+        result = _apply_board_fixture_quarantine(
+            root=root,
+            slug=slug,
+            path=path,
+            expected_generation=str(
+                cast(dict[str, object], board["snapshot"])["generation"]
+            ),
+            known_profiles=fresh_profiles,
+            known_project_ids=fresh_projects,
+            now=now,
+        )
+        results.append(result)
+        # Board snapshots are ordered by slug. The first durable mutation (or
+        # recovery of its missing receipt) consumes the one-action global tick
+        # budget; later boards remain visible as bounded deferred candidates.
+        recovery_budget_consumed = (
+            cast(int, result["mutations"]) > 0
+            or result["outcome"] == "receipt_recovered"
         )
     rejected = any(str(result["outcome"]).endswith("cas_mismatch") for result in results)
     payload = {

@@ -901,12 +901,54 @@ def test_safe_recovery_is_leaf_first_bounded_and_idempotent(
     assert events == 3
 
 
+def test_safe_recovery_enforces_one_global_board_mutation_per_tick(
+    fleet_home: Path, tmp_path: Path
+) -> None:
+    from hermes_cli.kanban_fleet import apply_safe_recovery
+
+    alpha_ids = _create_recovery_fixture(fleet_home, tmp_path, board="alpha")
+    beta_ids = _create_recovery_fixture(fleet_home, tmp_path, board="beta")
+
+    first = apply_safe_recovery(root=fleet_home, now=1_100, limit=1)
+
+    assert first["mutations"] <= 1, first
+    assert sum(board["mutations"] > 0 for board in first["boards"]) <= 1
+    assert [
+        board["board"] for board in first["boards"] if board["mutations"] > 0
+    ] == ["alpha"]
+    assert list(_task_statuses("alpha", alpha_ids).values()).count("archived") == 1
+    assert "archived" not in _task_statuses("beta", beta_ids).values()
+    deferred = next(board for board in first["boards"] if board["board"] == "beta")
+    assert deferred["outcome"] == "budget_deferred"
+    assert deferred["remaining_candidates"]["active"] == 3
+    assert len(deferred["remaining_candidates"]["task_ids"]) <= 1
+    assert deferred["remaining_candidates"]["omitted"] == 2
+
+    first_receipts = {
+        path.name
+        for path in (fleet_home / "kanban" / "reconciler-receipts").glob("*.json")
+    }
+    second = apply_safe_recovery(root=fleet_home, now=1_101, limit=1)
+
+    assert second["mutations"] <= 1, second
+    assert sum(board["mutations"] > 0 for board in second["boards"]) <= 1
+    assert list(_task_statuses("alpha", alpha_ids).values()).count("archived") == 2
+    assert "archived" not in _task_statuses("beta", beta_ids).values()
+    second_receipts = {
+        path.name
+        for path in (fleet_home / "kanban" / "reconciler-receipts").glob("*.json")
+    }
+    assert len(second_receipts) == 2
+    assert first_receipts < second_receipts
+
+
 def test_safe_recovery_restart_after_commit_recovers_receipt_without_remutation(
     fleet_home: Path, tmp_path: Path, monkeypatch
 ) -> None:
     from hermes_cli import kanban_fleet as fleet
 
     task_ids = _create_recovery_fixture(fleet_home, tmp_path)
+    beta_ids = _create_recovery_fixture(fleet_home, tmp_path, board="beta")
     injected = False
 
     def crash_after_commit(slug: str, task_id: str) -> None:
@@ -927,7 +969,11 @@ def test_safe_recovery_restart_after_commit_recovers_receipt_without_remutation(
 
     assert recovered["mutations"] == 0
     assert any(board["outcome"] == "receipt_recovered" for board in recovered["boards"])
+    assert next(board for board in recovered["boards"] if board["board"] == "beta")[
+        "outcome"
+    ] == "budget_deferred"
     assert list(_task_statuses("alpha", task_ids).values()).count("archived") == 1
+    assert "archived" not in _task_statuses("beta", beta_ids).values()
     assert len(list(receipt_dir.glob("*.json"))) == 1
 
 
