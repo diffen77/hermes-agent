@@ -554,6 +554,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_fleet.add_argument("--json", action="store_true", help="Emit JSON")
     p_fleet.add_argument(
+        "--verify", action="store_true",
+        help="Exit non-zero unless discovery and every board snapshot are verified",
+    )
+    p_fleet.add_argument(
+        "--apply-safe-recovery", action="store_true",
+        help="Apply bounded deterministic fixture quarantine (non-delegated only)",
+    )
+    p_fleet.add_argument(
         "--limit", type=int, default=20,
         help="Maximum task ids/running rows per diagnostic bucket (default: 20)",
     )
@@ -1492,18 +1500,40 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
 
 def _cmd_fleet(args: argparse.Namespace) -> int:
     """Print the cross-board projection without initializing any DB."""
-    from hermes_cli.kanban_fleet import build_fleet_ledger
+    from hermes_cli.kanban_fleet import apply_safe_recovery, build_fleet_ledger
 
     stale_after = _parse_duration(getattr(args, "stale_after", "1h"))
+    if getattr(args, "apply_safe_recovery", False):
+        result = apply_safe_recovery(
+            stale_after_seconds=stale_after or 3600,
+            limit=getattr(args, "limit", 20),
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        else:
+            print(
+                f"Kanban fleet safe recovery: verdict={result['verdict']} "
+                f"mutations={result['mutations']}"
+            )
+            for board in result.get("boards", []):
+                print(
+                    f"  {board['board']}: {board['outcome']} "
+                    f"mutations={board['mutations']}"
+                )
+        return 0 if result["verdict"] == "APPLIED" else 1
     ledger = build_fleet_ledger(
         stale_after_seconds=stale_after or 3600,
         limit=getattr(args, "limit", 20),
     )
     if getattr(args, "json", False):
         print(json.dumps(ledger, indent=2, ensure_ascii=False))
-        return 0
+        return 1 if getattr(args, "verify", False) and ledger["verdict"] != "VERIFIED" else 0
     totals = ledger["totals"]
     print("Kanban fleet owner ledger (read-only)")
+    print(
+        f"  verdict={ledger['verdict']} generation={ledger['observation_generation']} "
+        f"errors={ledger['errors']['count']}"
+    )
     print(
         "  boards={boards} running={running} stale={stale_running} "
         "blocked={blockers} stranded-ready={stranded_ready} "
@@ -1528,10 +1558,10 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
                 f"    {run['task_id']} run={run['run_id'] or '-'} "
                 f"owner={run['assignee'] or '-'} pid={run['pid'] or '-'} "
                 f"project={run['project_id'] or '-'} workspace={run['workspace'] or '-'} "
-                f"alive={'yes' if run['pid_alive'] else 'no'} "
+                f"process={run['process_identity']['classification']} "
                 f"heartbeat-age={heartbeat_age if heartbeat_age is not None else '-'}s"
             )
-    return 0
+    return 1 if getattr(args, "verify", False) and ledger["verdict"] != "VERIFIED" else 0
 
 
 def _cmd_create(args: argparse.Namespace) -> int:

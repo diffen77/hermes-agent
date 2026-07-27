@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -140,7 +141,11 @@ def test_fleet_ledger_is_read_only_and_surfaces_owner_diagnostics(
             "project_id": "p_real",
             "workspace": str(repo),
             "pid": os.getpid(),
-            "pid_alive": True,
+            "process_identity": {
+                "classification": "pid_reused_or_birth_mismatch",
+                "verdict": "NOT_VERIFIED",
+                "reclaim_authority": "NOT_AUTHORIZED",
+            },
             "last_heartbeat_at": now - 10,
             "heartbeat_age_seconds": 10,
             "heartbeat_fresh": True,
@@ -158,7 +163,11 @@ def test_fleet_ledger_is_read_only_and_surfaces_owner_diagnostics(
         "task_ids": sorted(fixture_ids),
         "omitted": 0,
     }
-    assert alpha["stale_running"] == {"count": 0, "task_ids": [], "omitted": 0}
+    assert alpha["stale_running"] == {
+        "count": 1,
+        "task_ids": [running],
+        "omitted": 0,
+    }
     assert ledger["totals"]["fixture_candidates_active"] == 3
 
 
@@ -348,3 +357,374 @@ def test_fleet_outputs_redact_and_bound_running_identity(
     assert len(running["workspace"]) <= 180
     assert "project=p_safe" in human_output
     assert "workspace=" in human_output
+
+
+def test_incomplete_discovery_prevents_false_green_verification(
+    fleet_home: Path, monkeypatch, capsys
+) -> None:
+    from hermes_cli import kanban_fleet as fleet
+
+    original_stat = Path.stat
+
+    def denied(path: Path, *args, **kwargs):
+        if path == fleet_home / "profiles":
+            raise PermissionError("secret path must not escape")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", denied)
+    ledger = fleet.build_fleet_ledger(root=fleet_home, now=123)
+
+    assert ledger["verdict"] == "NOT_VERIFIED"
+    assert ledger["completeness"]["profiles"] is False
+    assert ledger["observation_generation"]
+    assert ledger["errors"]["count"] >= 1
+    assert "secret path must not escape" not in json.dumps(ledger)
+
+    args = type("Args", (), {"stale_after": "1h", "limit": 20, "json": True, "verify": True})()
+    monkeypatch.setattr(fleet, "build_fleet_ledger", lambda **_: ledger)
+    assert kc._cmd_fleet(args) != 0
+    assert json.loads(capsys.readouterr().out)["verdict"] == "NOT_VERIFIED"
+
+
+def test_board_discovery_permission_error_is_bounded_and_not_verified(
+    fleet_home: Path, monkeypatch
+) -> None:
+    from hermes_cli import kanban_fleet as fleet
+
+    boards_dir = fleet_home / "kanban" / "boards"
+    original_iterdir = Path.iterdir
+
+    def denied(path: Path):
+        if path == boards_dir:
+            raise PermissionError("do not reveal this detail")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", denied)
+    ledger = fleet.build_fleet_ledger(root=fleet_home, now=123, limit=1)
+
+    assert ledger["completeness"]["boards"] is False
+    assert ledger["verdict"] == "NOT_VERIFIED"
+    assert ledger["errors"]["count"] == 1
+    assert len(ledger["errors"]["items"]) <= 1
+    assert "do not reveal this detail" not in json.dumps(ledger)
+
+
+def test_discovery_errors_remain_bounded(fleet_home: Path) -> None:
+    from hermes_cli.kanban_fleet import build_fleet_ledger
+
+    boards_dir = fleet_home / "kanban" / "boards"
+    for index in range(30):
+        (boards_dir / f"invalid-{index:02d}" / "kanban.db").mkdir(parents=True)
+
+    ledger = build_fleet_ledger(
+        root=fleet_home,
+        known_profiles={"default"},
+        known_project_ids={"p_known"},
+        now=123,
+        limit=100,
+    )
+
+    assert ledger["verdict"] == "NOT_VERIFIED"
+    assert ledger["errors"]["count"] == 30
+    assert len(ledger["errors"]["items"]) == 20
+    assert ledger["errors"]["omitted"] == 10
+
+
+def test_board_discovery_deduplicates_symlink_and_hardlink_aliases(
+    fleet_home: Path,
+) -> None:
+    from hermes_cli.kanban_fleet import build_fleet_ledger
+
+    alpha = fleet_home / "kanban" / "boards" / "alpha" / "kanban.db"
+    alias_dir = fleet_home / "kanban" / "boards" / "alpha-alias"
+    alias_dir.mkdir()
+    try:
+        os.link(alpha, alias_dir / "kanban.db")
+    except OSError:
+        (alias_dir / "kanban.db").symlink_to(alpha)
+
+    ledger = build_fleet_ledger(
+        root=fleet_home,
+        known_profiles={"default"},
+        known_project_ids={"p_known"},
+        now=123,
+    )
+
+    assert [board["slug"] for board in ledger["boards"]] == ["alpha", "beta"]
+    assert ledger["totals"]["boards"] == 2
+
+
+def test_board_snapshot_is_coherent_under_concurrent_write(
+    fleet_home: Path, monkeypatch
+) -> None:
+    from hermes_cli import kanban_fleet as fleet
+
+    with kb.connect_closing(board="alpha") as conn:
+        parent = kb.create_task(conn, title="parent")
+    writer_errors: list[BaseException] = []
+
+    def write_after_tasks(slug: str) -> None:
+        if slug != "alpha":
+            return
+
+        def writer() -> None:
+            try:
+                with kb.connect_closing(board="alpha") as conn:
+                    child = kb.create_task(conn, title="concurrent child", parents=(parent,))
+                    assert child
+            except BaseException as exc:  # pragma: no cover - asserted below
+                writer_errors.append(exc)
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    monkeypatch.setattr(fleet, "_after_tasks_snapshot", write_after_tasks)
+    ledger = fleet.build_fleet_ledger(
+        root=fleet_home,
+        known_profiles={"default"},
+        known_project_ids={"p_known"},
+        now=123,
+    )
+
+    assert writer_errors == []
+    alpha = ledger["boards"][0]
+    assert alpha["counts"] == {"ready": 1}
+    assert alpha["snapshot"]["verdict"] == "VERIFIED"
+
+
+def test_board_snapshot_rejects_identity_drift(
+    fleet_home: Path, monkeypatch
+) -> None:
+    from hermes_cli import kanban_fleet as fleet
+
+    original_identity = fleet._path_identity
+    alpha = fleet_home / "kanban" / "boards" / "alpha" / "kanban.db"
+    alpha_calls = 0
+
+    def drifting_identity(path: Path) -> tuple[int, int]:
+        nonlocal alpha_calls
+        identity = original_identity(path)
+        if path == alpha:
+            alpha_calls += 1
+            if alpha_calls > 1:
+                return identity[0], identity[1] + 1
+        return identity
+
+    monkeypatch.setattr(fleet, "_path_identity", drifting_identity)
+    ledger = fleet.build_fleet_ledger(
+        root=fleet_home,
+        known_profiles={"default"},
+        known_project_ids={"p_known"},
+        now=123,
+    )
+
+    assert ledger["verdict"] == "NOT_VERIFIED"
+    assert ledger["completeness"]["boards"] is False
+    assert [board["slug"] for board in ledger["boards"]] == ["beta"]
+    assert ledger["errors"]["items"] == [
+        {"scope": "boards", "code": "board_snapshot_drift"}
+    ]
+
+
+def test_pid_reuse_and_permission_ambiguity_are_never_dead(monkeypatch) -> None:
+    from hermes_cli import kanban_fleet as fleet
+
+    monkeypatch.setattr(
+        fleet,
+        "_read_process_identity",
+        lambda pid: {"state": "present", "birth_epoch": 500},
+    )
+    reused = fleet._classify_process_identity(77, expected_started_at=100)
+    monkeypatch.setattr(
+        fleet,
+        "_read_process_identity",
+        lambda pid: {"state": "permission_denied"},
+    )
+    denied = fleet._classify_process_identity(77, expected_started_at=100)
+
+    assert reused["classification"] == "pid_reused_or_birth_mismatch"
+    assert reused["verdict"] == "NOT_VERIFIED"
+    assert denied == {
+        "classification": "permission_denied",
+        "verdict": "NOT_VERIFIED",
+        "reclaim_authority": "NOT_AUTHORIZED",
+    }
+    assert "dead" not in json.dumps([reused, denied]).lower()
+
+
+def _create_recovery_fixture(
+    fleet_home: Path, tmp_path: Path, *, board: str = "alpha"
+) -> list[str]:
+    with sqlite3.connect(fleet_home / "projects.db") as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY)")
+        conn.execute("INSERT OR IGNORE INTO projects (id) VALUES ('p_real')")
+    root = tmp_path / "safe-recovery-fixture"
+    task_ids: list[str] = []
+    parent = None
+    with kb.connect_closing(board=board) as conn:
+        for step, assignee in (
+            ("implementation", "builder"),
+            ("verifier", "reviewer"),
+            ("closure", "closer"),
+        ):
+            task_id = kb.create_task(
+                conn,
+                title=f"Recovery fixture {step}",
+                assignee=assignee,
+                created_by="orchestrator",
+                parents=(parent,) if parent else (),
+                workspace_kind="worktree",
+                workspace_path=str(root / ".worktrees" / step),
+            )
+            conn.execute(
+                "UPDATE tasks SET project_id='p_fixture', created_at=123, "
+                "workflow_template_id='delivery_v1', current_step_key=? WHERE id=?",
+                (step, task_id),
+            )
+            task_ids.append(task_id)
+            parent = task_id
+    return task_ids
+
+
+def _task_statuses(board: str, task_ids: list[str]) -> dict[str, str]:
+    with kb.connect_closing(board=board) as conn:
+        return {
+            str(row["id"]): str(row["status"])
+            for row in conn.execute(
+                f"SELECT id, status FROM tasks WHERE id IN ({','.join('?' for _ in task_ids)})",
+                task_ids,
+            )
+        }
+
+
+def test_safe_recovery_is_leaf_first_bounded_and_idempotent(
+    fleet_home: Path, tmp_path: Path
+) -> None:
+    from hermes_cli.kanban_fleet import apply_safe_recovery
+
+    task_ids = _create_recovery_fixture(fleet_home, tmp_path)
+    implementation, verifier, closure = task_ids
+
+    first = apply_safe_recovery(root=fleet_home, now=1_000)
+    assert first["verdict"] == "APPLIED"
+    assert first["mutations"] == 1, first
+    assert max(board["mutations"] for board in first["boards"]) <= 1
+    assert _task_statuses("alpha", task_ids) == {
+        implementation: "ready",
+        verifier: "todo",
+        closure: "archived",
+    }
+
+    second = apply_safe_recovery(root=fleet_home, now=1_001)
+    third = apply_safe_recovery(root=fleet_home, now=1_002)
+    fourth = apply_safe_recovery(root=fleet_home, now=1_003)
+
+    assert second["mutations"] == 1
+    assert third["mutations"] == 1
+    assert fourth["mutations"] == 0
+    assert set(_task_statuses("alpha", task_ids).values()) == {"archived"}
+    receipts = sorted((fleet_home / "kanban" / "reconciler-receipts").glob("*.json"))
+    assert len(receipts) == 3
+    assert all((path.stat().st_mode & 0o777) == 0o600 for path in receipts)
+    assert all(json.loads(path.read_text())["action"] == "fixture_quarantine" for path in receipts)
+    with kb.connect_closing(board="alpha") as conn:
+        events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE kind='archived' "
+            "AND json_extract(payload, '$.source')='fleet_safe_recovery'"
+        ).fetchone()[0]
+    assert events == 3
+
+
+def test_safe_recovery_restart_after_commit_recovers_receipt_without_remutation(
+    fleet_home: Path, tmp_path: Path, monkeypatch
+) -> None:
+    from hermes_cli import kanban_fleet as fleet
+
+    task_ids = _create_recovery_fixture(fleet_home, tmp_path)
+    injected = False
+
+    def crash_after_commit(slug: str, task_id: str) -> None:
+        nonlocal injected
+        injected = True
+        raise RuntimeError("simulated process loss")
+
+    monkeypatch.setattr(fleet, "_after_recovery_commit", crash_after_commit)
+    with pytest.raises(RuntimeError, match="simulated process loss"):
+        fleet.apply_safe_recovery(root=fleet_home, now=2_000)
+    assert injected is True
+    assert list(_task_statuses("alpha", task_ids).values()).count("archived") == 1
+    receipt_dir = fleet_home / "kanban" / "reconciler-receipts"
+    assert not receipt_dir.exists() or list(receipt_dir.glob("*.json")) == []
+
+    monkeypatch.setattr(fleet, "_after_recovery_commit", lambda slug, task_id: None)
+    recovered = fleet.apply_safe_recovery(root=fleet_home, now=2_001)
+
+    assert recovered["mutations"] == 0
+    assert any(board["outcome"] == "receipt_recovered" for board in recovered["boards"])
+    assert list(_task_statuses("alpha", task_ids).values()).count("archived") == 1
+    assert len(list(receipt_dir.glob("*.json"))) == 1
+
+
+def test_safe_recovery_denies_delegated_child_without_writes(
+    fleet_home: Path, tmp_path: Path, monkeypatch
+) -> None:
+    from hermes_cli.kanban_fleet import apply_safe_recovery
+
+    _create_recovery_fixture(fleet_home, tmp_path)
+    before = _tree_fingerprint(fleet_home)
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+
+    result = apply_safe_recovery(root=fleet_home, now=3_000)
+
+    assert result == {
+        "verdict": "DENIED",
+        "reason": "delegated_child_context",
+        "mutations": 0,
+        "boards": [],
+    }
+    assert _tree_fingerprint(fleet_home) == before
+
+
+@pytest.mark.parametrize("unsafe_status", ["running", "blocked", "review"])
+def test_safe_recovery_never_mutates_live_or_human_gated_fixture(
+    fleet_home: Path, tmp_path: Path, unsafe_status: str
+) -> None:
+    from hermes_cli.kanban_fleet import apply_safe_recovery
+
+    task_ids = _create_recovery_fixture(fleet_home, tmp_path)
+    closure = task_ids[-1]
+    with kb.connect_closing(board="alpha") as conn:
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", (unsafe_status, closure))
+    before = _tree_fingerprint(fleet_home)
+
+    result = apply_safe_recovery(root=fleet_home, now=4_000)
+
+    assert result["mutations"] == 0
+    assert _tree_fingerprint(fleet_home) == before
+
+
+def test_safe_recovery_fresh_generation_cas_rejects_racing_write(
+    fleet_home: Path, tmp_path: Path, monkeypatch
+) -> None:
+    from hermes_cli import kanban_fleet as fleet
+
+    task_ids = _create_recovery_fixture(fleet_home, tmp_path)
+    wrote = False
+
+    def race_after_snapshot(slug: str) -> None:
+        nonlocal wrote
+        if slug != "alpha" or wrote:
+            return
+        wrote = True
+        with kb.connect_closing(board="alpha") as conn:
+            kb.create_task(conn, title="racing authoritative write")
+
+    monkeypatch.setattr(fleet, "_after_tasks_snapshot", race_after_snapshot)
+    result = fleet.apply_safe_recovery(root=fleet_home, now=5_000)
+
+    assert wrote is True
+    assert result["mutations"] == 0
+    assert any(board["outcome"] == "cas_mismatch" for board in result["boards"])
+    assert "archived" not in _task_statuses("alpha", task_ids).values()

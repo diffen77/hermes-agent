@@ -8,6 +8,7 @@ SQLite files and opens them with ``mode=ro`` only.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 import stat
@@ -26,6 +27,31 @@ _KNOWN_FIXTURE_ASSIGNEES = frozenset(
     {"builder", "reviewer", "closer", "grok-creative"}
 )
 _DELIVERY_STEPS = frozenset({"implementation", "verifier", "closure"})
+_MAX_DISCOVERY_ERRORS = 20
+_SAFE_FIXTURE_STATUSES = frozenset(
+    {"triage", "todo", "scheduled", "ready", "done"}
+)
+_TASK_SELECT = (
+    "SELECT id, title, assignee, status, created_by, created_at, "
+    "project_id, workspace_path, workflow_template_id, current_step_key, "
+    "current_run_id, worker_pid, last_heartbeat_at, started_at "
+    "FROM tasks ORDER BY id"
+)
+_RUN_SELECT = (
+    "SELECT id, task_id, worker_pid, last_heartbeat_at, started_at "
+    "FROM task_runs WHERE ended_at IS NULL ORDER BY id"
+)
+
+
+class _BoundedErrors:
+    def __init__(self) -> None:
+        self.total = 0
+        self.items: list[dict[str, str]] = []
+
+    def add(self, scope: str, code: str) -> None:
+        self.total += 1
+        if len(self.items) < _MAX_DISCOVERY_ERRORS:
+            self.items.append({"scope": scope, "code": code})
 
 
 def _readonly_connect(path: Path) -> sqlite3.Connection:
@@ -42,18 +68,67 @@ def _readonly_connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _board_paths(root: Path) -> list[tuple[str, Path]]:
+def _record_error(errors: _BoundedErrors, scope: str, code: str) -> None:
+    """Record a bounded, non-sensitive error category."""
+    errors.add(scope, code)
+
+
+def _board_paths(
+    root: Path, errors: _BoundedErrors | None = None
+) -> tuple[list[tuple[str, Path]], bool]:
+    errors = errors if errors is not None else _BoundedErrors()
     found: list[tuple[str, Path]] = []
+    complete = True
+    identities: set[tuple[int, int]] = set()
+
+    def add(slug: str, path: Path) -> None:
+        nonlocal complete
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            return
+        except OSError:
+            complete = False
+            _record_error(errors, "boards", "board_stat_failed")
+            return
+        if not stat.S_ISREG(info.st_mode):
+            complete = False
+            _record_error(errors, "boards", "board_not_regular")
+            return
+        identity = (info.st_dev, info.st_ino)
+        if identity in identities:
+            return
+        identities.add(identity)
+        found.append((slug, path))
+
     default = root / "kanban.db"
-    if default.is_file():
-        found.append((kb.DEFAULT_BOARD, default))
+    add(kb.DEFAULT_BOARD, default)
     boards = root / "kanban" / "boards"
-    if boards.is_dir():
-        for child in sorted(boards.iterdir(), key=lambda item: item.name):
-            db = child / "kanban.db"
-            if child.is_dir() and db.is_file():
-                found.append((child.name, db))
-    return found
+    try:
+        boards_mode = boards.stat().st_mode
+    except FileNotFoundError:
+        return found, complete
+    except OSError:
+        _record_error(errors, "boards", "boards_directory_stat_failed")
+        return found, False
+    if not stat.S_ISDIR(boards_mode):
+        _record_error(errors, "boards", "boards_path_not_directory")
+        return found, False
+    try:
+        children = sorted(boards.iterdir(), key=lambda item: item.name)
+    except OSError:
+        _record_error(errors, "boards", "boards_directory_read_failed")
+        return found, False
+    for child in children:
+        try:
+            is_directory = stat.S_ISDIR(child.stat().st_mode)
+        except OSError:
+            complete = False
+            _record_error(errors, "boards", "board_directory_stat_failed")
+            continue
+        if is_directory:
+            add(child.name, child / "kanban.db")
+    return found, complete
 
 
 def _profile_directories(root: Path) -> tuple[list[Path], bool]:
@@ -94,7 +169,10 @@ def _optional_regular_file(path: Path) -> tuple[bool, bool]:
     return is_file, is_file
 
 
-def _known_profile_names(root: Path) -> tuple[set[str], bool]:
+def _known_profile_names(
+    root: Path, errors: _BoundedErrors | None = None
+) -> tuple[set[str], bool]:
+    errors = errors if errors is not None else _BoundedErrors()
     names: set[str] = set()
     complete = True
     try:
@@ -104,31 +182,44 @@ def _known_profile_names(root: Path) -> tuple[set[str], bool]:
     except OSError:
         root_mode = None
         complete = False
+        _record_error(errors, "profiles", "root_stat_failed")
     if root_mode is not None:
         if stat.S_ISDIR(root_mode):
             names.add("default")
         else:
             complete = False
+            _record_error(errors, "profiles", "root_not_directory")
 
     profiles, profiles_complete = _profile_directories(root)
+    if not profiles_complete:
+        _record_error(errors, "profiles", "profile_discovery_failed")
     complete = complete and profiles_complete
     for profile in profiles:
         is_config, config_complete = _optional_regular_file(profile / "config.yaml")
         complete = complete and config_complete
+        if not config_complete:
+            _record_error(errors, "profiles", "profile_config_stat_failed")
         if is_config:
             names.add(profile.name)
     return names, complete
 
 
-def _known_project_ids(root: Path) -> tuple[set[str], bool]:
+def _known_project_ids(
+    root: Path, errors: _BoundedErrors | None = None
+) -> tuple[set[str], bool]:
+    errors = errors if errors is not None else _BoundedErrors()
     ids: set[str] = set()
     complete = True
     profiles, profiles_complete = _profile_directories(root)
+    if not profiles_complete:
+        _record_error(errors, "projects", "profile_discovery_failed")
     complete = complete and profiles_complete
     paths = [root / "projects.db", *(profile / "projects.db" for profile in profiles)]
     for path in paths:
         is_registry, registry_complete = _optional_regular_file(path)
         complete = complete and registry_complete
+        if not registry_complete:
+            _record_error(errors, "projects", "project_registry_stat_failed")
         if not is_registry:
             continue
         try:
@@ -138,14 +229,16 @@ def _known_project_ids(root: Path) -> tuple[set[str], bool]:
                 ).fetchone()
                 if not table:
                     complete = False
+                    _record_error(errors, "projects", "project_registry_schema_missing")
                     continue
                 ids.update(
                     str(row[0])
                     for row in conn.execute("SELECT id FROM projects")
                     if row[0]
                 )
-        except sqlite3.Error:
+        except (OSError, sqlite3.Error):
             complete = False
+            _record_error(errors, "projects", "project_registry_read_failed")
     return ids, complete
 
 
@@ -252,15 +345,109 @@ def classify_fixture_candidates(
     return result
 
 
-def _pid_alive(pid_value: object) -> bool:
+def _read_process_identity(pid: int) -> dict[str, object]:
+    """Return bounded identity evidence without exposing cmdline or environment."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return {"state": "not_found"}
+    except PermissionError:
+        return {"state": "permission_denied"}
+    except OSError:
+        return {"state": "unknown"}
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        start_ticks = int(raw.rsplit(")", 1)[1].split()[19])
+        boot_line = next(
+            line
+            for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines()
+            if line.startswith("btime ")
+        )
+        birth_epoch = int(boot_line.split()[1]) + start_ticks / os.sysconf("SC_CLK_TCK")
+        return {"state": "present", "birth_epoch": int(birth_epoch)}
+    except PermissionError:
+        return {"state": "permission_denied"}
+    except (FileNotFoundError, ProcessLookupError):
+        return {"state": "birth_ambiguous"}
+    except (OSError, ValueError, IndexError, StopIteration):
+        return {"state": "birth_ambiguous"}
+
+
+def _classify_process_identity(
+    pid_value: object, *, expected_started_at: int | None
+) -> dict[str, str]:
     try:
         pid = int(pid_value)
-        if pid <= 0:
-            return False
-        os.kill(pid, 0)
-        return True
-    except (TypeError, ValueError, OSError):
-        return False
+    except (TypeError, ValueError):
+        return {
+            "classification": "pid_missing_or_invalid",
+            "verdict": "NOT_VERIFIED",
+            "reclaim_authority": "NOT_AUTHORIZED",
+        }
+    if pid <= 0:
+        return {
+            "classification": "pid_missing_or_invalid",
+            "verdict": "NOT_VERIFIED",
+            "reclaim_authority": "NOT_AUTHORIZED",
+        }
+    observed = _read_process_identity(pid)
+    state = str(observed.get("state") or "unknown")
+    if state != "present":
+        return {
+            "classification": state,
+            "verdict": "NOT_VERIFIED",
+            "reclaim_authority": "NOT_AUTHORIZED",
+        }
+    birth = observed.get("birth_epoch")
+    if birth is None or expected_started_at is None:
+        classification = "birth_ambiguous"
+    elif int(birth) > int(expected_started_at) + 2:
+        classification = "pid_reused_or_birth_mismatch"
+    else:
+        # This corroborates the row but cannot authorize reclaim: the exact
+        # process birth identity was not persisted when the run was claimed.
+        classification = "present_birth_consistent"
+    return {
+        "classification": classification,
+        "verdict": "NOT_VERIFIED",
+        "reclaim_authority": "NOT_AUTHORIZED",
+    }
+
+
+def _after_tasks_snapshot(slug: str) -> None:
+    """Test seam after the first table read in the coherent transaction."""
+
+
+def _path_identity(path: Path) -> tuple[int, int]:
+    info = path.stat()
+    return info.st_dev, info.st_ino
+
+
+class _ObservationDriftError(RuntimeError):
+    pass
+
+
+def _snapshot_generation(
+    identity: tuple[int, int],
+    schema_version: int,
+    tasks: list[dict[str, object]],
+    links: list[tuple[object, object]],
+    run_rows: dict[int, dict[str, object]],
+) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            [
+                identity[0],
+                identity[1],
+                schema_version,
+                tasks,
+                links,
+                [run_rows[key] for key in sorted(run_rows)],
+            ],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()[:20]
 
 
 def _bounded(ids: Iterable[str], limit: int) -> dict[str, object]:
@@ -310,23 +497,33 @@ def _board_ledger(
     stale_after_seconds: int,
     limit: int,
 ) -> dict[str, object]:
+    identity_before = _path_identity(path)
     with closing(_readonly_connect(path)) as conn:
-        tasks = [dict(row) for row in conn.execute(
-            "SELECT id, title, assignee, status, created_by, created_at, "
-            "project_id, workspace_path, workflow_template_id, current_step_key, "
-            "current_run_id, worker_pid, last_heartbeat_at, started_at "
-            "FROM tasks ORDER BY id"
-        )]
+        conn.execute("BEGIN")
+        schema_before = int(conn.execute("PRAGMA schema_version").fetchone()[0])
+        data_before = int(conn.execute("PRAGMA data_version").fetchone()[0])
+        tasks = [dict(row) for row in conn.execute(_TASK_SELECT)]
+        _after_tasks_snapshot(slug)
         links = [tuple(row) for row in conn.execute(
             "SELECT parent_id, child_id FROM task_links ORDER BY parent_id, child_id"
         )]
         run_rows = {
             int(row["id"]): dict(row)
-            for row in conn.execute(
-                "SELECT id, task_id, worker_pid, last_heartbeat_at, started_at "
-                "FROM task_runs WHERE ended_at IS NULL"
-            )
+            for row in conn.execute(_RUN_SELECT)
         }
+        schema_after = int(conn.execute("PRAGMA schema_version").fetchone()[0])
+        data_after = int(conn.execute("PRAGMA data_version").fetchone()[0])
+        identity_after = _path_identity(path)
+        conn.rollback()
+    if (
+        identity_before != identity_after
+        or schema_before != schema_after
+        or data_before != data_after
+    ):
+        raise _ObservationDriftError("board identity or generation drifted")
+    snapshot_generation = _snapshot_generation(
+        identity_before, schema_before, tasks, links, run_rows
+    )
 
     candidates = classify_fixture_candidates(
         tasks,
@@ -349,8 +546,14 @@ def _board_ledger(
         started = run.get("started_at") or row.get("started_at")
         age = max(0, now - int(heartbeat)) if heartbeat is not None else None
         fresh = age is not None and age <= stale_after_seconds
-        alive = _pid_alive(pid)
-        if not alive or (not fresh and started is not None and now - int(started) > stale_after_seconds):
+        process_identity = _classify_process_identity(
+            pid,
+            expected_started_at=int(started) if started is not None else None,
+        )
+        if process_identity["classification"] in {
+            "not_found",
+            "pid_reused_or_birth_mismatch",
+        } or (not fresh and started is not None and now - int(started) > stale_after_seconds):
             stale_ids.append(str(row["id"]))
         running.append(
             {
@@ -360,7 +563,7 @@ def _board_ledger(
                 "project_id": row.get("project_id"),
                 "workspace": row.get("workspace_path"),
                 "pid": int(pid) if pid is not None else None,
-                "pid_alive": alive,
+                "process_identity": process_identity,
                 "last_heartbeat_at": int(heartbeat) if heartbeat is not None else None,
                 "heartbeat_age_seconds": age,
                 "heartbeat_fresh": fresh,
@@ -385,6 +588,7 @@ def _board_ledger(
     fixture_ids = sorted(candidates)[:limit]
     return {
         "slug": slug,
+        "snapshot": {"generation": snapshot_generation, "verdict": "VERIFIED"},
         "counts": counts,
         "running": running[:limit],
         "running_omitted": max(0, len(running) - limit),
@@ -410,31 +614,49 @@ def build_fleet_ledger(
     limit: int = 20,
 ) -> dict[str, object]:
     """Build a bounded, deterministic, read-only fleet projection."""
-    root = (root or kb.kanban_home()).expanduser().resolve()
+    root_value = (root or kb.kanban_home()).expanduser()
+    root = Path(os.path.abspath(root_value))
+    errors = _BoundedErrors()
     if known_profiles is None:
-        known_profiles, profiles_complete = _known_profile_names(root)
+        known_profiles, profiles_complete = _known_profile_names(root, errors)
     else:
         profiles_complete = True
     if known_project_ids is None:
-        known_project_ids, projects_complete = _known_project_ids(root)
+        known_project_ids, projects_complete = _known_project_ids(root, errors)
     else:
         projects_complete = True
     now = int(time.time()) if now is None else int(now)
     limit = max(1, min(int(limit), 100))
-    boards = [
-        _board_ledger(
-            slug,
-            path,
-            known_profiles=set(known_profiles),
-            known_project_ids=set(known_project_ids),
-            profiles_complete=profiles_complete,
-            projects_complete=projects_complete,
-            now=now,
-            stale_after_seconds=max(1, int(stale_after_seconds)),
-            limit=limit,
-        )
-        for slug, path in _board_paths(root)
-    ]
+    board_paths, boards_complete = _board_paths(root, errors)
+    boards: list[dict[str, object]] = []
+    for slug, path in board_paths:
+        try:
+            boards.append(
+                _board_ledger(
+                    slug,
+                    path,
+                    known_profiles=set(known_profiles),
+                    known_project_ids=set(known_project_ids),
+                    profiles_complete=profiles_complete,
+                    projects_complete=projects_complete,
+                    now=now,
+                    stale_after_seconds=max(1, int(stale_after_seconds)),
+                    limit=limit,
+                )
+            )
+        except _ObservationDriftError:
+            boards_complete = False
+            _record_error(errors, "boards", "board_snapshot_drift")
+        except (OSError, sqlite3.Error):
+            boards_complete = False
+            _record_error(errors, "boards", "board_snapshot_read_failed")
+    completeness = {
+        "profiles": profiles_complete,
+        "projects": projects_complete,
+        "boards": boards_complete,
+    }
+    verified = all(completeness.values())
+    verdict = "VERIFIED" if verified else "NOT_VERIFIED"
     totals = {
         "boards": len(boards),
         "running": sum(len(board["running"]) + int(board["running_omitted"]) for board in boards),
@@ -444,9 +666,311 @@ def build_fleet_ledger(
         "fixture_candidates_active": sum(int(board["fixture_candidates"]["active"]) for board in boards),
         "fixture_candidates_quarantined": sum(int(board["fixture_candidates"]["quarantined"]) for board in boards),
     }
-    return cast(
-        dict[str, object],
-        _safe_projection(
-            {"generated_at": now, "root": str(root), "totals": totals, "boards": boards}
-        ),
+    generation_payload = {
+        "generated_at": now,
+        "completeness": completeness,
+        "boards": [
+            [board["slug"], board["snapshot"]["generation"]] for board in boards
+        ],
+    }
+    observation_generation = hashlib.sha256(
+        json.dumps(generation_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:20]
+    error_limit = min(limit, _MAX_DISCOVERY_ERRORS)
+    payload = {
+        "generated_at": now,
+        "observation_generation": observation_generation,
+        "verdict": verdict,
+        "reclaim_authority": "NOT_AUTHORIZED",
+        "completeness": completeness,
+        "errors": {
+            "count": errors.total,
+            "items": errors.items[:error_limit],
+            "omitted": max(0, errors.total - min(error_limit, len(errors.items))),
+        },
+        "root": str(root),
+        "totals": totals,
+        "boards": boards,
+    }
+    return cast(dict[str, object], _safe_projection(payload))
+
+
+def _recovery_receipt_id(slug: str, task_id: str) -> str:
+    return hashlib.sha256(
+        f"fixture-quarantine-v1\0{slug}\0{task_id}".encode()
+    ).hexdigest()
+
+
+def _receipt_path(root: Path, receipt_id: str) -> Path:
+    return root / "kanban" / "reconciler-receipts" / f"{receipt_id}.json"
+
+
+def _write_recovery_receipt(root: Path, payload: dict[str, object]) -> Path:
+    """Atomically persist one bounded, redacted idempotency receipt."""
+    receipt_id = str(payload["receipt_id"])
+    target = _receipt_path(root, receipt_id)
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    safe = cast(dict[str, object], _safe_projection(payload))
+    data = (json.dumps(safe, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{receipt_id}.", suffix=".tmp", dir=target.parent
     )
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        directory_fd = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+    return target
+
+
+def _after_recovery_commit(slug: str, task_id: str) -> None:
+    """Failure-injection seam after the durable DB commit, before the receipt."""
+
+
+def _apply_board_fixture_quarantine(
+    *,
+    root: Path,
+    slug: str,
+    path: Path,
+    expected_generation: str,
+    known_profiles: set[str],
+    known_project_ids: set[str],
+    now: int,
+) -> dict[str, object]:
+    """CAS one proven, non-running fixture leaf to archived."""
+    identity_before = _path_identity(path)
+    conn = sqlite3.connect(path, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("BEGIN IMMEDIATE")
+        schema_version = int(conn.execute("PRAGMA schema_version").fetchone()[0])
+        tasks = [dict(row) for row in conn.execute(_TASK_SELECT)]
+        links = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT parent_id, child_id FROM task_links ORDER BY parent_id, child_id"
+            )
+        ]
+        run_rows = {
+            int(row["id"]): dict(row) for row in conn.execute(_RUN_SELECT)
+        }
+        identity_locked = _path_identity(path)
+        actual_generation = _snapshot_generation(
+            identity_locked,
+            schema_version,
+            tasks,
+            links,
+            run_rows,
+        )
+        if identity_before != identity_locked or actual_generation != expected_generation:
+            conn.rollback()
+            return {"board": slug, "outcome": "cas_mismatch", "mutations": 0}
+
+        candidates = classify_fixture_candidates(
+            tasks,
+            links,
+            known_profiles=known_profiles,
+            known_project_ids=known_project_ids,
+            profiles_complete=True,
+            projects_complete=True,
+        )
+        rows = {str(row["id"]): row for row in tasks}
+        active_children = {
+            str(parent)
+            for parent, child in links
+            if str(child) in rows and rows[str(child)].get("status") != "archived"
+        }
+        for task_id in sorted(candidates):
+            row = rows[task_id]
+            receipt_id = _recovery_receipt_id(slug, task_id)
+            receipt = _receipt_path(root, receipt_id)
+            if row.get("status") != "archived" or receipt.is_file():
+                continue
+            conn.rollback()
+            _write_recovery_receipt(
+                root,
+                {
+                    "receipt_id": receipt_id,
+                    "action": "fixture_quarantine",
+                    "board": slug,
+                    "task_id": task_id,
+                    "outcome": "already_archived",
+                    "recorded_at": now,
+                },
+            )
+            return {
+                "board": slug,
+                "outcome": "receipt_recovered",
+                "mutations": 0,
+                "receipt_id": receipt_id,
+            }
+
+        for task_id in sorted(candidates):
+            row = rows[task_id]
+            receipt_id = _recovery_receipt_id(slug, task_id)
+            receipt = _receipt_path(root, receipt_id)
+            if receipt.is_file():
+                continue
+            if (
+                row.get("status") not in _SAFE_FIXTURE_STATUSES
+                or row.get("current_run_id") is not None
+                or row.get("worker_pid") is not None
+                or task_id in active_children
+            ):
+                continue
+            updated = conn.execute(
+                "UPDATE tasks SET status='archived', claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL "
+                "WHERE id=? AND status=? AND current_run_id IS NULL "
+                "AND worker_pid IS NULL",
+                (task_id, row["status"]),
+            )
+            if updated.rowcount != 1:
+                conn.rollback()
+                return {"board": slug, "outcome": "cas_mismatch", "mutations": 0}
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, NULL, 'archived', ?, ?)",
+                (
+                    task_id,
+                    json.dumps(
+                        {
+                            "source": "fleet_safe_recovery",
+                            "class": "fixture_quarantine",
+                            "receipt_id": receipt_id,
+                        },
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+            conn.commit()
+            _after_recovery_commit(slug, task_id)
+            _write_recovery_receipt(
+                root,
+                {
+                    "receipt_id": receipt_id,
+                    "action": "fixture_quarantine",
+                    "board": slug,
+                    "task_id": task_id,
+                    "outcome": "applied",
+                    "recorded_at": now,
+                    "observation_generation": expected_generation,
+                },
+            )
+            return {
+                "board": slug,
+                "outcome": "applied",
+                "mutations": 1,
+                "receipt_id": receipt_id,
+            }
+        conn.rollback()
+        return {"board": slug, "outcome": "no_safe_candidate", "mutations": 0}
+    finally:
+        conn.close()
+
+
+def apply_safe_recovery(
+    *,
+    root: Path | None = None,
+    now: int | None = None,
+    stale_after_seconds: int = 3600,
+    limit: int = 20,
+) -> dict[str, object]:
+    """Apply only reversible deterministic fixture quarantine recoveries.
+
+    Human decisions, credentials, costs, product/runtime state, blocked tasks,
+    stranded work, and ambiguous worker ownership are deliberately excluded.
+    """
+    if os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"):
+        return {
+            "verdict": "DENIED",
+            "reason": "delegated_child_context",
+            "mutations": 0,
+            "boards": [],
+        }
+    root_value = (root or kb.kanban_home()).expanduser()
+    root = Path(os.path.abspath(root_value))
+    errors = _BoundedErrors()
+    known_profiles, profiles_complete = _known_profile_names(root, errors)
+    known_project_ids, projects_complete = _known_project_ids(root, errors)
+    if (
+        not profiles_complete
+        or not projects_complete
+        or not known_profiles
+        or not known_project_ids
+    ):
+        return {
+            "verdict": "NOT_VERIFIED",
+            "reason": "authority_discovery_incomplete",
+            "mutations": 0,
+            "boards": [],
+        }
+    now = int(time.time()) if now is None else int(now)
+    ledger = build_fleet_ledger(
+        root=root,
+        known_profiles=known_profiles,
+        known_project_ids=known_project_ids,
+        now=now,
+        stale_after_seconds=stale_after_seconds,
+        limit=limit,
+    )
+    if ledger["verdict"] != "VERIFIED":
+        return {
+            "verdict": "NOT_VERIFIED",
+            "reason": "fleet_observation_incomplete",
+            "observation_generation": ledger["observation_generation"],
+            "mutations": 0,
+            "boards": [],
+        }
+    board_paths, paths_complete = _board_paths(root)
+    if not paths_complete:
+        return {
+            "verdict": "NOT_VERIFIED",
+            "reason": "board_rediscovery_incomplete",
+            "observation_generation": ledger["observation_generation"],
+            "mutations": 0,
+            "boards": [],
+        }
+    paths_by_slug = {slug: path for slug, path in board_paths}
+    results: list[dict[str, object]] = []
+    ledger_boards = cast(list[dict[str, object]], ledger["boards"])
+    for board in ledger_boards:
+        slug = str(board["slug"])
+        path = paths_by_slug.get(slug)
+        if path is None:
+            results.append({"board": slug, "outcome": "cas_mismatch", "mutations": 0})
+            continue
+        results.append(
+            _apply_board_fixture_quarantine(
+                root=root,
+                slug=slug,
+                path=path,
+                expected_generation=str(
+                    cast(dict[str, object], board["snapshot"])["generation"]
+                ),
+                known_profiles=known_profiles,
+                known_project_ids=known_project_ids,
+                now=now,
+            )
+        )
+    payload = {
+        "verdict": "APPLIED",
+        "observation_generation": ledger["observation_generation"],
+        "mutations": sum(cast(int, result["mutations"]) for result in results),
+        "boards": results,
+    }
+    return cast(dict[str, object], _safe_projection(payload))
