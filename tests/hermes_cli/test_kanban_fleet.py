@@ -670,13 +670,14 @@ def test_safe_recovery_restart_after_commit_recovers_receipt_without_remutation(
 def test_safe_recovery_denies_delegated_child_without_writes(
     fleet_home: Path, tmp_path: Path, monkeypatch
 ) -> None:
+    from agent.delegation_context import delegated_child_context
     from hermes_cli.kanban_fleet import apply_safe_recovery
 
     _create_recovery_fixture(fleet_home, tmp_path)
     before = _tree_fingerprint(fleet_home)
-    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
 
-    result = apply_safe_recovery(root=fleet_home, now=3_000)
+    with delegated_child_context():
+        result = apply_safe_recovery(root=fleet_home, now=3_000)
 
     assert result == {
         "verdict": "DENIED",
@@ -684,6 +685,11 @@ def test_safe_recovery_denies_delegated_child_without_writes(
         "mutations": 0,
         "boards": [],
     }
+    assert _tree_fingerprint(fleet_home) == before
+
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+    subprocess_result = apply_safe_recovery(root=fleet_home, now=3_001)
+    assert subprocess_result == result
     assert _tree_fingerprint(fleet_home) == before
 
 
@@ -725,6 +731,37 @@ def test_safe_recovery_fresh_generation_cas_rejects_racing_write(
     result = fleet.apply_safe_recovery(root=fleet_home, now=5_000)
 
     assert wrote is True
+    assert result["verdict"] == "NOT_VERIFIED"
+    assert result["reason"] == "fresh_authority_cas_rejected"
     assert result["mutations"] == 0
     assert any(board["outcome"] == "cas_mismatch" for board in result["boards"])
+    assert "archived" not in _task_statuses("alpha", task_ids).values()
+
+
+def test_safe_recovery_rechecks_profile_and_project_authorities_before_apply(
+    fleet_home: Path, tmp_path: Path, monkeypatch
+) -> None:
+    from hermes_cli import kanban_fleet as fleet
+
+    task_ids = _create_recovery_fixture(fleet_home, tmp_path)
+    original = fleet._known_project_ids
+    calls = 0
+
+    def changing_projects(root: Path, errors=None):
+        nonlocal calls
+        calls += 1
+        projects, complete = original(root, errors)
+        if calls > 1:
+            projects.add("p_fixture")
+        return projects, complete
+
+    monkeypatch.setattr(fleet, "_known_project_ids", changing_projects)
+    result = fleet.apply_safe_recovery(root=fleet_home, now=5_100)
+
+    assert result["verdict"] == "NOT_VERIFIED"
+    assert result["reason"] == "fresh_authority_cas_rejected"
+    assert result["mutations"] == 0
+    boards = result["boards"]
+    assert isinstance(boards, list)
+    assert any(board["outcome"] == "authority_cas_mismatch" for board in boards)
     assert "archived" not in _task_statuses("alpha", task_ids).values()

@@ -895,7 +895,13 @@ def apply_safe_recovery(
     Human decisions, credentials, costs, product/runtime state, blocked tasks,
     stranded work, and ambiguous worker ownership are deliberately excluded.
     """
-    if os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"):
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        delegated = is_delegated_child_process_context()
+    except Exception:
+        delegated = bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+    if delegated:
         return {
             "verdict": "DENIED",
             "reason": "delegated_child_context",
@@ -954,6 +960,21 @@ def apply_safe_recovery(
         if path is None:
             results.append({"board": slug, "outcome": "cas_mismatch", "mutations": 0})
             continue
+        # Profile/project registries are separate authorities from each board.
+        # Re-read them immediately before the board transaction; absence may
+        # never become proof merely because the earlier observation is stale.
+        fresh_profiles, fresh_profiles_complete = _known_profile_names(root)
+        fresh_projects, fresh_projects_complete = _known_project_ids(root)
+        if (
+            not fresh_profiles_complete
+            or not fresh_projects_complete
+            or fresh_profiles != known_profiles
+            or fresh_projects != known_project_ids
+        ):
+            results.append(
+                {"board": slug, "outcome": "authority_cas_mismatch", "mutations": 0}
+            )
+            continue
         results.append(
             _apply_board_fixture_quarantine(
                 root=root,
@@ -962,13 +983,15 @@ def apply_safe_recovery(
                 expected_generation=str(
                     cast(dict[str, object], board["snapshot"])["generation"]
                 ),
-                known_profiles=known_profiles,
-                known_project_ids=known_project_ids,
+                known_profiles=fresh_profiles,
+                known_project_ids=fresh_projects,
                 now=now,
             )
         )
+    rejected = any(str(result["outcome"]).endswith("cas_mismatch") for result in results)
     payload = {
-        "verdict": "APPLIED",
+        "verdict": "NOT_VERIFIED" if rejected else "APPLIED",
+        "reason": "fresh_authority_cas_rejected" if rejected else None,
         "observation_generation": ledger["observation_generation"],
         "mutations": sum(cast(int, result["mutations"]) for result in results),
         "boards": results,
