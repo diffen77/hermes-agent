@@ -171,3 +171,94 @@ def test_fleet_cli_json_does_not_initialize_missing_default_board(
     assert _tree_fingerprint(fleet_home) == before
     assert [board["slug"] for board in payload["boards"]] == ["alpha", "beta"]
     assert not (fleet_home / "kanban.db").exists()
+
+
+def _delivery_fixture_rows(tmp_path: Path, project_id: str):
+    rows = []
+    links = []
+    parent = None
+    for index, (step, assignee) in enumerate(
+        (("implementation", "builder"), ("verifier", "reviewer"), ("closure", "closer"))
+    ):
+        task_id = f"t_delivery_{index}"
+        rows.append(
+            {
+                "id": task_id,
+                "assignee": assignee,
+                "project_id": project_id,
+                "workspace_path": str(tmp_path / ".worktrees" / task_id),
+                "created_at": 123,
+                "workflow_template_id": "delivery_v1",
+                "current_step_key": step,
+            }
+        )
+        if parent is not None:
+            links.append((parent, task_id))
+        parent = task_id
+    return rows, links
+
+
+def test_fixture_classifier_preserves_known_p102_delivery_rows(tmp_path: Path) -> None:
+    from hermes_cli.kanban_fleet import classify_fixture_candidates
+
+    rows, links = _delivery_fixture_rows(tmp_path, "p_102c8528")
+
+    assert classify_fixture_candidates(
+        rows,
+        links,
+        known_profiles={"john", "raffe", "janne"},
+        known_project_ids={"p_102c8528"},
+    ) == {}
+
+
+@pytest.mark.parametrize(
+    ("known_profiles", "known_project_ids"),
+    [
+        ({"john", "raffe", "janne"}, set()),
+        (set(), {"p_unrelated"}),
+    ],
+)
+def test_fixture_classifier_fails_closed_without_registry_or_profile_evidence(
+    tmp_path: Path,
+    known_profiles: set[str],
+    known_project_ids: set[str],
+) -> None:
+    from hermes_cli.kanban_fleet import classify_fixture_candidates
+
+    rows, links = _delivery_fixture_rows(tmp_path, "p_102c8528")
+
+    assert classify_fixture_candidates(
+        rows,
+        links,
+        known_profiles=known_profiles,
+        known_project_ids=known_project_ids,
+    ) == {}
+
+
+def test_fleet_outputs_redact_and_bound_running_identity(
+    fleet_home: Path, tmp_path: Path
+) -> None:
+    secret = "ghp_" + "A" * 24
+    workspace = tmp_path / secret / ("nested-" + "x" * 300)
+    with kb.connect_closing(board="alpha") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="safe",
+            assignee="john",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        conn.execute("UPDATE tasks SET project_id=? WHERE id=?", ("p_safe", task_id))
+        assert kb.claim_task(conn, task_id, claimer="john") is not None
+
+    json_output = kc.run_slash("fleet --json")
+    human_output = kc.run_slash("fleet")
+    payload = json.loads(json_output)
+    running = payload["boards"][0]["running"][0]
+
+    assert secret not in json_output
+    assert secret not in human_output
+    assert running["project_id"] == "p_safe"
+    assert len(running["workspace"]) <= 180
+    assert "project=p_safe" in human_output
+    assert "workspace=" in human_output

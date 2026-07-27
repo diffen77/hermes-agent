@@ -7,6 +7,7 @@ SQLite files and opens them with ``mode=ro`` only.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 import tempfile
@@ -14,9 +15,10 @@ import time
 from collections import Counter, defaultdict
 from contextlib import closing
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Iterable, Mapping, cast
 from urllib.parse import quote
 
+from agent.redact import redact_sensitive_text
 from hermes_cli import kanban_db as kb
 
 _KNOWN_FIXTURE_ASSIGNEES = frozenset(
@@ -112,6 +114,11 @@ def classify_fixture_candidates(
     and belong to a multi-task family with delivery dependency evidence or the
     known Grok review-fixture topology.
     """
+    # Absence can only be proven against positive registry evidence. If either
+    # discovery source is unavailable/empty, classifying a real delivery row as
+    # a fixture would be destructive, so fail closed.
+    if not known_profiles or not known_project_ids:
+        return {}
     rows = [dict(row) for row in tasks]
     eligible: dict[str, dict[str, object]] = {}
     families: dict[tuple[object, object, str | None], list[dict[str, object]]] = defaultdict(list)
@@ -184,6 +191,35 @@ def _bounded(ids: Iterable[str], limit: int) -> dict[str, object]:
     ordered = sorted(set(ids))
     shown = ordered[:limit]
     return {"count": len(ordered), "task_ids": shown, "omitted": len(ordered) - len(shown)}
+
+
+def _safe_text(value: str, limit: int = 180) -> str:
+    """Force-redact and deterministically bound a string at the ledger boundary."""
+    safe = redact_sensitive_text(
+        value,
+        force=True,
+        redact_url_credentials=True,
+    )
+    if len(safe) <= limit:
+        return safe
+    suffix = f"…#{hashlib.sha256(safe.encode()).hexdigest()[:12]}"
+    return safe[: limit - len(suffix)] + suffix
+
+
+def _safe_projection(value: object) -> object:
+    """Apply the egress safety boundary to every projected string/key."""
+    if isinstance(value, str):
+        return _safe_text(value)
+    if isinstance(value, list):
+        return [_safe_projection(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_safe_projection(item) for item in value)
+    if isinstance(value, dict):
+        return {
+            _safe_text(key) if isinstance(key, str) else key: _safe_projection(item)
+            for key, item in value.items()
+        }
+    return value
 
 
 def _board_ledger(
@@ -322,4 +358,9 @@ def build_fleet_ledger(
         "fixture_candidates_active": sum(int(board["fixture_candidates"]["active"]) for board in boards),
         "fixture_candidates_quarantined": sum(int(board["fixture_candidates"]["quarantined"]) for board in boards),
     }
-    return {"generated_at": now, "root": str(root), "totals": totals, "boards": boards}
+    return cast(
+        dict[str, object],
+        _safe_projection(
+            {"generated_at": now, "root": str(root), "totals": totals, "boards": boards}
+        ),
+    )

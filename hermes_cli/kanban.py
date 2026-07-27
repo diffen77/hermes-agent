@@ -1527,6 +1527,7 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
             print(
                 f"    {run['task_id']} run={run['run_id'] or '-'} "
                 f"owner={run['assignee'] or '-'} pid={run['pid'] or '-'} "
+                f"project={run['project_id'] or '-'} workspace={run['workspace'] or '-'} "
                 f"alive={'yes' if run['pid_alive'] else 'no'} "
                 f"heartbeat-age={heartbeat_age if heartbeat_age is not None else '-'}s"
             )
