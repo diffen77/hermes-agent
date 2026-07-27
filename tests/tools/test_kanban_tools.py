@@ -1251,6 +1251,50 @@ def test_create_default_child_inherits_project_without_reusing_worktree(
         conn.close()
 
 
+def test_project_worker_explicit_workspace_keeps_forward_project_ownership(
+    monkeypatch, worker_env, tmp_path,
+):
+    """A worker workspace choice must not silently detach its follow-up task.
+
+    Factory reviewers commonly request an explicit worktree while creating a
+    remediation card.  The workspace is an execution detail; the dispatcher's
+    project binding is durable routing identity and must still flow forward.
+    """
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with pdb.connect_closing() as project_conn:
+        project_id = pdb.create_project(
+            project_conn, name="Factory Project", folders=[str(repo)],
+        )
+
+    with kb.connect() as conn:
+        parent_id = kb.create_task(
+            conn, title="implementation", assignee="writer",
+            project_id=project_id,
+        )
+        kb.claim_task(conn, parent_id)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", parent_id)
+
+    result = json.loads(kt._handle_create({
+        "title": "independent verification",
+        "assignee": "reviewer",
+        "parents": [parent_id],
+        "workspace_kind": "worktree",
+        "workspace_path": str(repo),
+    }))
+
+    assert result["ok"] is True
+    assert result["project_id"] == project_id
+    with kb.connect() as conn:
+        child = kb.get_task(conn, result["task_id"])
+    assert child is not None
+    assert child.project_id == project_id
+
+
 def test_create_cross_profile_project_children_keep_isolated_worktree_routing(
     monkeypatch, tmp_path,
 ):
