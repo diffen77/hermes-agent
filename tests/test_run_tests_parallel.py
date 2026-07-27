@@ -225,6 +225,93 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
     )
 
 
+def test_external_probe_cannot_inherit_live_kanban_paths(tmp_path: Path) -> None:
+    """Each file gets a private Hermes root, even without repo conftest.
+
+    Delivery/review verification often materializes an explicit test file in
+    ``/tmp``.  Such a file is outside ``tests/`` and therefore does not inherit
+    this repository's conftest.  A dispatcher-spawned verifier also inherits
+    ``HERMES_KANBAN_DB``; forwarding that pin let the temporary test mutate the
+    real board before its first fixture could replace ``HERMES_HOME``.
+    """
+    import sqlite3
+
+    repo_root = Path(__file__).resolve().parent.parent
+    inherited_home = tmp_path / "live-home"
+    inherited_home.mkdir()
+    inherited_db = inherited_home / "kanban.db"
+    with sqlite3.connect(inherited_db) as conn:
+        conn.execute("CREATE TABLE sentinel (value TEXT NOT NULL)")
+        conn.execute("INSERT INTO sentinel VALUES ('unchanged')")
+    before = inherited_db.read_bytes()
+
+    probe_dir = tmp_path / "external-review"
+    probe_dir.mkdir()
+    observed = tmp_path / "observed.json"
+    (probe_dir / "test_external_review.py").write_text(
+        textwrap.dedent(
+            f"""
+            import json
+            import os
+            from pathlib import Path
+
+            from hermes_cli import kanban_db as kb
+
+            def test_uses_private_board():
+                home = Path(os.environ["HERMES_HOME"]).resolve()
+                db = kb.kanban_db_path().resolve()
+                assert home != Path({str(inherited_home)!r}).resolve()
+                assert db != Path({str(inherited_db)!r}).resolve()
+                assert db.is_relative_to(home)
+                with kb.connect() as conn:
+                    kb.create_task(conn, title="fixture", assignee="builder")
+                Path({str(observed)!r}).write_text(json.dumps({{
+                    "home": str(home), "db": str(db),
+                    "count": 1,
+                }}))
+            """
+        ),
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env.update(
+        HERMES_HOME=str(inherited_home),
+        HERMES_KANBAN_HOME=str(inherited_home),
+        HERMES_KANBAN_DB=str(inherited_db),
+        HERMES_KANBAN_BOARD="jonbacken",
+        HERMES_KANBAN_TASK="t_live",
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / "scripts" / "run_tests_parallel.py"),
+            "--files",
+            str(probe_dir / "test_external_review.py"),
+            "-j",
+            "1",
+            "--file-timeout",
+            "30",
+            "-q",
+        ],
+        cwd=repo_root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    assert observed.exists(), proc.stdout
+    assert json.loads(observed.read_text(encoding="utf-8"))["count"] == 1
+    assert inherited_db.read_bytes() == before
+    with sqlite3.connect(inherited_db) as conn:
+        assert conn.execute("SELECT value FROM sentinel").fetchone() == ("unchanged",)
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'tasks'"
+        ).fetchone() is None
+
+
 def test_bare_q_flag_passes_through(tmp_path: Path) -> None:
     """A bare ``-q`` (no ``--``) runs clean instead of erroring out."""
     probe_dir = _make_probe_dir(tmp_path)

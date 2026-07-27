@@ -44,6 +44,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -306,22 +307,41 @@ def _run_one_file_once(
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
-    
+
+    # A test file may live outside this repository (delivery/review agents
+    # commonly materialize focused probes under /tmp), so it may not load
+    # tests/conftest.py.  Isolate at the process boundary instead of relying
+    # on fixture discovery.  In particular, never forward a dispatcher's
+    # HERMES_KANBAN_DB pin into pytest: that points at the live board.
+    isolation = tempfile.TemporaryDirectory(prefix="hermes-test-file-")
+    isolated_home = Path(isolation.name) / "hermes_home"
+    isolated_home.mkdir()
+    child_env = dict(os.environ)
+    for name in tuple(child_env):
+        if name.startswith("HERMES_KANBAN_") or name == "HERMES_TENANT":
+            child_env.pop(name, None)
+    child_env["HERMES_HOME"] = str(isolated_home)
+    child_env["HERMES_KANBAN_HOME"] = str(isolated_home)
+
     subproc_start = time.monotonic()
     # launch the pytest process
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace",
-        env=os.environ,
-        # POSIX: place the child at the head of its own process group so
-        # _kill_tree can SIGKILL the group atomically.
-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-        # _kill_tree handles the Windows path via taskkill /F /T.
-        start_new_session=True,
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            env=child_env,
+            # POSIX: place the child at the head of its own process group so
+            # _kill_tree can SIGKILL the group atomically.
+            # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
+            # _kill_tree handles the Windows path via taskkill /F /T.
+            start_new_session=True,
+        )
+    except BaseException:
+        isolation.cleanup()
+        raise
 
     # Capture the pgid NOW, before the leader can exit and be reaped. Once
     # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
@@ -359,6 +379,8 @@ def _run_one_file_once(
         _kill_tree(proc, pgid=pgid)
 
         output +=  "\n"
+    finally:
+        isolation.cleanup()
 
     if rc == 5:
         # No tests collected in THIS file — legitimate per-file: a

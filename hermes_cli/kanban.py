@@ -547,6 +547,21 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit JSON (structured) instead of the default human table",
     )
 
+    # --- fleet (read-only owner ledger across every board) ---
+    p_fleet = sub.add_parser(
+        "fleet",
+        help="Show a bounded read-only owner ledger across every board",
+    )
+    p_fleet.add_argument("--json", action="store_true", help="Emit JSON")
+    p_fleet.add_argument(
+        "--limit", type=int, default=20,
+        help="Maximum task ids/running rows per diagnostic bucket (default: 20)",
+    )
+    p_fleet.add_argument(
+        "--stale-after", default="1h",
+        help="Heartbeat age treated as stale (default: 1h)",
+    )
+
     # --- link / unlink ---
     p_link = sub.add_parser("link", help="Add a parent->child dependency")
     p_link.add_argument("parent_id")
@@ -994,6 +1009,8 @@ def kanban_command(args: argparse.Namespace) -> int:
     # alpha.
     if action == "boards":
         return _dispatch_boards(args)
+    if action == "fleet":
+        return _cmd_fleet(args)
 
     # `--board <slug>` applies to every subcommand below by way of an
     # env-var pin for the duration of this call. Using HERMES_KANBAN_BOARD
@@ -1470,6 +1487,49 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
         counts = entry["counts"] or {}
         count_str = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "(idle)"
         print(f"{entry['name']:20s}  {on_disk:8s}  {count_str}")
+    return 0
+
+
+def _cmd_fleet(args: argparse.Namespace) -> int:
+    """Print the cross-board projection without initializing any DB."""
+    from hermes_cli.kanban_fleet import build_fleet_ledger
+
+    stale_after = _parse_duration(getattr(args, "stale_after", "1h"))
+    ledger = build_fleet_ledger(
+        stale_after_seconds=stale_after or 3600,
+        limit=getattr(args, "limit", 20),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(ledger, indent=2, ensure_ascii=False))
+        return 0
+    totals = ledger["totals"]
+    print("Kanban fleet owner ledger (read-only)")
+    print(
+        "  boards={boards} running={running} stale={stale_running} "
+        "blocked={blockers} stranded-ready={stranded_ready} "
+        "fixture-active={fixture_candidates_active} "
+        "fixture-quarantined={fixture_candidates_quarantined}".format(**totals)
+    )
+    for board in ledger["boards"]:
+        counts = ", ".join(
+            f"{status}={count}" for status, count in board["counts"].items()
+        ) or "empty"
+        print(
+            f"  {board['slug']}: {counts}; "
+            f"running={len(board['running']) + board['running_omitted']} "
+            f"stale={board['stale_running']['count']} "
+            f"blocked={board['blockers']['count']} "
+            f"stranded={board['stranded_ready']['count']} "
+            f"fixtures={board['fixture_candidates']['active']}"
+        )
+        for run in board["running"]:
+            heartbeat_age = run["heartbeat_age_seconds"]
+            print(
+                f"    {run['task_id']} run={run['run_id'] or '-'} "
+                f"owner={run['assignee'] or '-'} pid={run['pid'] or '-'} "
+                f"alive={'yes' if run['pid_alive'] else 'no'} "
+                f"heartbeat-age={heartbeat_age if heartbeat_age is not None else '-'}s"
+            )
     return 0
 
 
