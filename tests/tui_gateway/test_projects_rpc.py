@@ -221,6 +221,55 @@ def test_session_info_carries_project_for_owned_cwd(tmp_path):
     assert info["project"]["name"] == "Proj"
 
 
+def test_task_active_project_resolves_exact_session_cwd(monkeypatch, tmp_path):
+    folder_a = tmp_path / "a"
+    folder_b = tmp_path / "b"
+    folder_a.mkdir()
+    folder_b.mkdir()
+    project_a = _call(
+        "projects.create", {"name": "A", "folders": [str(folder_a)]}
+    )["project"]["id"]
+    project_b = _call(
+        "projects.create", {"name": "B", "folders": [str(folder_b)]}
+    )["project"]["id"]
+    monkeypatch.setattr(
+        server,
+        "_sessions",
+        {
+            "sid-a": {"session_key": "task-a", "cwd": str(folder_a)},
+            "sid-b": {"session_key": "task-b", "cwd": str(folder_b)},
+        },
+    )
+
+    assert server._active_project_for_task("task-a") == project_a
+    assert server._active_project_for_task("task-b") == project_b
+    assert server._active_project_for_task("missing") is None
+
+
+def test_wire_callbacks_registers_task_active_project_reader(monkeypatch):
+    from tools import project_tools, skills_tool, terminal_tool
+
+    seen = {}
+    monkeypatch.setattr(terminal_tool, "set_sudo_password_callback", lambda fn: None)
+    monkeypatch.setattr(skills_tool, "set_secret_capture_callback", lambda fn: None)
+    monkeypatch.setattr(
+        project_tools,
+        "set_project_workspace_callback",
+        lambda fn: seen.setdefault("workspace", fn),
+    )
+    monkeypatch.setattr(
+        project_tools,
+        "set_project_active_callback",
+        lambda fn: seen.setdefault("active", fn),
+        raising=False,
+    )
+
+    server._wire_callbacks("sid")
+
+    assert seen["workspace"] is server._apply_project_workspace
+    assert seen["active"] is server._active_project_for_task
+
+
 def test_update_and_archive(tmp_path):
     pid = _call("projects.create", {"name": "Orig", "folders": [str(tmp_path)]})["project"]["id"]
 

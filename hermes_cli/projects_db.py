@@ -319,6 +319,28 @@ def _unique_slug(conn: sqlite3.Connection, candidate: str) -> str:
     return slug
 
 
+def _assert_paths_unowned_locked(
+    conn: sqlite3.Connection,
+    paths: Iterable[str],
+    *,
+    exclude_project_id: Optional[str] = None,
+) -> None:
+    """Reject exact path ownership conflicts while a write transaction is held."""
+    for path in paths:
+        owner = conn.execute(
+            "SELECT DISTINCT p.id, p.name, p.created_at FROM projects p "
+            "LEFT JOIN project_folders f ON f.project_id = p.id "
+            "WHERE p.archived = 0 AND (p.primary_path = ? OR f.path = ?) "
+            "AND (? IS NULL OR p.id <> ?) "
+            "ORDER BY p.created_at ASC, p.id ASC LIMIT 1",
+            (path, path, exclude_project_id, exclude_project_id),
+        ).fetchone()
+        if owner is not None:
+            raise ValueError(
+                f"path already belongs to project '{owner['name']}': {path}"
+            )
+
+
 def create_project(
     conn: sqlite3.Connection,
     *,
@@ -358,6 +380,7 @@ def create_project(
         primary = folder_paths[0]
 
     with write_txn(conn):
+        _assert_paths_unowned_locked(conn, folder_paths)
         unique = _unique_slug(conn, slug_candidate)
         conn.execute(
             "INSERT INTO projects "
@@ -479,6 +502,7 @@ def add_folder(
         raise ValueError(f"no such project: {project_id}")
     now = _now()
     with write_txn(conn):
+        _assert_paths_unowned_locked(conn, [norm], exclude_project_id=project_id)
         conn.execute(
             "INSERT OR IGNORE INTO project_folders "
             "(project_id, path, label, is_primary, added_at) "
@@ -577,6 +601,26 @@ def archive_project(conn: sqlite3.Connection, project_id: str) -> bool:
 
 def restore_project(conn: sqlite3.Connection, project_id: str) -> bool:
     with write_txn(conn):
+        project = conn.execute(
+            "SELECT archived, primary_path FROM projects WHERE id = ?",
+            (project_id,),
+        ).fetchone()
+        if project is None:
+            return False
+        if project["archived"]:
+            paths = [
+                row["path"]
+                for row in conn.execute(
+                    "SELECT path FROM project_folders WHERE project_id = ?",
+                    (project_id,),
+                ).fetchall()
+            ]
+            primary_path = project["primary_path"]
+            if primary_path and primary_path not in paths:
+                paths.append(primary_path)
+            _assert_paths_unowned_locked(
+                conn, paths, exclude_project_id=project_id
+            )
         cur = conn.execute(
             "UPDATE projects SET archived = 0 WHERE id = ?", (project_id,)
         )

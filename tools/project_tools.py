@@ -18,16 +18,23 @@ from typing import Callable, Optional
 
 from tools.registry import registry
 
-# Set by the GUI gateway (tui_gateway) at session wiring. Receives
-# ``(task_id, primary_path, project_name)`` and re-anchors that session's
-# workspace + refreshes the sidebar. ``None`` in CLI / messaging contexts — the
-# DB write still happens; there's just no live GUI session to move.
+# Set by the GUI gateway (tui_gateway) at session wiring. The workspace writer
+# receives ``(task_id, primary_path, project_name)`` and re-anchors that session's
+# workspace + refreshes the sidebar. The active reader receives ``task_id`` and
+# returns the project owning that exact session's cwd. Both are ``None`` in CLI /
+# messaging contexts.
 _workspace_callback: Optional[Callable[[str, str, str], None]] = None
+_active_project_callback: Optional[Callable[[str], Optional[str]]] = None
 
 
 def set_project_workspace_callback(fn: Optional[Callable[[str, str, str], None]]) -> None:
     global _workspace_callback
     _workspace_callback = fn
+
+
+def set_project_active_callback(fn: Optional[Callable[[str], Optional[str]]]) -> None:
+    global _active_project_callback
+    _active_project_callback = fn
 
 
 def _primary_path(proj) -> Optional[str]:
@@ -70,8 +77,16 @@ def project_list(task_id: Optional[str] = None) -> str:
     from hermes_cli import projects_db as pdb
 
     with pdb.connect_closing() as conn:
-        active = pdb.get_active_id(conn)
+        active = pdb.get_active_id(conn) if not task_id else None
         projects = pdb.list_projects(conn)
+
+    if task_id:
+        callback = _active_project_callback
+        if callback is not None:
+            try:
+                active = callback(task_id)
+            except Exception:
+                active = None
 
     return json.dumps({
         "active_id": active,
@@ -102,7 +117,8 @@ def project_create(name: str, path: Optional[str] = None, task_id: Optional[str]
     try:
         with pdb.connect_closing() as conn:
             pid = pdb.create_project(conn, name=name, folders=[folder] if folder else [], primary_path=folder or None)
-            pdb.set_active(conn, pid)
+            if not task_id:
+                pdb.set_active(conn, pid)
             proj = pdb.get_project(conn, pid)
     except ValueError as exc:
         return json.dumps({"success": False, "error": str(exc)})
@@ -123,7 +139,8 @@ def project_switch(project: str, task_id: Optional[str] = None) -> str:
         proj = _resolve(conn, project)
         if proj is None:
             return json.dumps({"success": False, "error": f"no project matching '{project}'"})
-        pdb.set_active(conn, proj.id)
+        if not task_id:
+            pdb.set_active(conn, proj.id)
 
     primary = _primary_path(proj)
     _apply_workspace(task_id, primary, proj.name)

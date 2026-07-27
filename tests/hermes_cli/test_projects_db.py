@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 
 import pytest
 
@@ -109,6 +110,145 @@ def test_slug_collision_disambiguates(conn):
 def test_empty_name_rejected(conn):
     with pytest.raises(ValueError):
         pdb.create_project(conn, name="   ")
+
+
+def test_create_rejects_duplicate_normalized_primary_path(conn):
+    pdb.create_project(conn, name="First", folders=["/www/app"])
+
+    with pytest.raises(
+        ValueError, match=r"already belongs to project 'First'.*/www/app"
+    ):
+        pdb.create_project(
+            conn,
+            name="Duplicate",
+            primary_path="/www/app/child/..",
+        )
+
+
+def test_create_rejects_duplicate_folder_ownership(conn):
+    pdb.create_project(
+        conn,
+        name="First",
+        folders=["/www/first", "/www/shared"],
+        primary_path="/www/first",
+    )
+
+    with pytest.raises(
+        ValueError, match=r"already belongs to project 'First'.*/www/shared"
+    ):
+        pdb.create_project(
+            conn,
+            name="Duplicate",
+            folders=["/www/second", "/www/shared/"],
+            primary_path="/www/second",
+        )
+
+
+def test_create_allows_archived_path_reuse(conn):
+    old = pdb.create_project(conn, name="Archived", folders=["/www/app"])
+    pdb.archive_project(conn, old)
+
+    replacement = pdb.create_project(conn, name="Replacement", folders=["/www/app"])
+
+    project = pdb.get_project(conn, replacement)
+    assert project is not None
+    assert project.primary_path == "/www/app"
+
+
+def test_add_folder_rejects_path_owned_by_another_active_project(conn):
+    first = pdb.create_project(conn, name="First", folders=["/www/first"])
+    second = pdb.create_project(conn, name="Second", folders=["/www/second"])
+
+    with pytest.raises(
+        ValueError, match=r"already belongs to project 'First'.*/www/first"
+    ):
+        pdb.add_folder(conn, second, "/www/first/child/..")
+
+    first_project = pdb.get_project(conn, first)
+    second_project = pdb.get_project(conn, second)
+    assert first_project is not None
+    assert second_project is not None
+    assert {folder.path for folder in first_project.folders} == {"/www/first"}
+    assert {folder.path for folder in second_project.folders} == {"/www/second"}
+
+
+def test_restore_rejects_path_reused_by_another_active_project(conn):
+    archived = pdb.create_project(conn, name="Archived", folders=["/www/app"])
+    assert pdb.archive_project(conn, archived) is True
+    replacement = pdb.create_project(
+        conn, name="Replacement", folders=["/www/app"]
+    )
+
+    with pytest.raises(
+        ValueError, match=r"already belongs to project 'Replacement'.*/www/app"
+    ):
+        pdb.restore_project(conn, archived)
+
+    archived_project = pdb.get_project(conn, archived)
+    replacement_project = pdb.get_project(conn, replacement)
+    assert archived_project is not None
+    assert replacement_project is not None
+    assert archived_project.archived is True
+    assert replacement_project.archived is False
+
+
+def test_concurrent_create_allows_only_one_exact_path_owner(tmp_path):
+    db_path = tmp_path / "projects.db"
+    pdb.connect(db_path=db_path).close()
+    barrier = threading.Barrier(3)
+    results: list[str] = []
+    errors: list[Exception] = []
+    lock = threading.Lock()
+
+    def create(name: str) -> None:
+        barrier.wait()
+        conn = pdb.connect(db_path=db_path)
+        try:
+            pdb.create_project(conn, name=name, folders=["/www/app"])
+            with lock:
+                results.append(name)
+        except Exception as exc:
+            with lock:
+                errors.append(exc)
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=create, args=(name,)) for name in ("A", "B")]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert len(results) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+    assert "already belongs to project" in str(errors[0])
+    with pdb.connect_closing(db_path=db_path) as check:
+        assert len(pdb.list_projects(check)) == 1
+
+
+def test_create_allows_distinct_ancestor_and_multifolder_paths(conn):
+    outer = pdb.create_project(
+        conn,
+        name="Outer",
+        folders=["/www", "/srv/outer"],
+        primary_path="/www",
+    )
+    inner = pdb.create_project(
+        conn,
+        name="Inner",
+        folders=["/www/app", "/srv/inner"],
+        primary_path="/www/app",
+    )
+
+    outer_project = pdb.get_project(conn, outer)
+    inner_project = pdb.get_project(conn, inner)
+    assert outer_project is not None
+    assert inner_project is not None
+    assert outer_project.primary_path == "/www"
+    assert inner_project.primary_path == "/www/app"
 
 
 def test_add_remove_folder_and_primary_repoint(conn):

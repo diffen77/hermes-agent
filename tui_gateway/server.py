@@ -5076,6 +5076,30 @@ def _agent_cbs(sid: str) -> dict:
     return callbacks
 
 
+def _session_for_task(task_id: str) -> tuple[str, dict | None]:
+    """Resolve only the live GUI session identified by a project tool task id."""
+    # The tool's task_id is the durable session_key, but _sessions is keyed by a
+    # short sid uuid (and the desktop routes events by that sid). Resolve it.
+    key = str(task_id or "")
+    with _sessions_lock:
+        if key in _sessions:
+            return key, _sessions[key]
+        for cand_sid, cand in _sessions.items():
+            if cand.get("session_key") == key or getattr(
+                cand.get("agent"), "session_id", None
+            ) == key:
+                return cand_sid, cand
+    return "", None
+
+
+def _active_project_for_task(task_id: str) -> str | None:
+    """Return the project owning one exact task's cwd, failing closed."""
+    _sid, session = _session_for_task(task_id)
+    cwd = session.get("cwd") if session is not None else None
+    project = _project_info_for_cwd(str(cwd or ""))
+    return str(project["id"]) if project and project.get("id") else None
+
+
 def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
     """Intentional workspace move from the project_* tools: re-anchor the live
     session's cwd to the chosen project's folder and push session.info so the
@@ -5084,19 +5108,7 @@ def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
     if not path:
         return
 
-    # The tool's task_id is the durable session_key, but _sessions is keyed by a
-    # short sid uuid (and the desktop routes events by that sid). Resolve it.
-    key = str(task_id or "")
-    sid = ""
-    session = None
-    with _sessions_lock:
-        if key in _sessions:
-            sid, session = key, _sessions[key]
-        else:
-            for cand_sid, cand in _sessions.items():
-                if cand.get("session_key") == key or getattr(cand.get("agent"), "session_id", None) == key:
-                    sid, session = cand_sid, cand
-                    break
+    sid, session = _session_for_task(task_id)
 
     if session is None:
         return
@@ -5138,10 +5150,14 @@ def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
 def _wire_callbacks(sid: str):
     from tools.terminal_tool import set_sudo_password_callback
     from tools.skills_tool import set_secret_capture_callback
-    from tools.project_tools import set_project_workspace_callback
+    from tools.project_tools import (
+        set_project_active_callback,
+        set_project_workspace_callback,
+    )
 
     set_sudo_password_callback(lambda: _block("sudo.request", sid, {}, timeout=120))
     set_project_workspace_callback(_apply_project_workspace)
+    set_project_active_callback(_active_project_for_task)
 
     def secret_cb(env_var, prompt, metadata=None):
         pl = {"prompt": prompt, "env_var": env_var}
