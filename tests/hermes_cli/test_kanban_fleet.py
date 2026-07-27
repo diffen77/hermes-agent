@@ -6,6 +6,7 @@ import os
 import sqlite3
 import threading
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -247,6 +248,71 @@ def test_mixed_project_registry_failure_cannot_establish_project_absence(
         known_project_ids=project_ids,
         projects_complete=projects_complete,
     ) == {}
+
+
+@pytest.mark.parametrize(
+    "registry_relative",
+    (Path("projects.db"), Path("profiles") / "worker" / "projects.db"),
+)
+def test_project_registry_observation_drift_is_bounded_and_not_verified(
+    fleet_home: Path, monkeypatch, registry_relative: Path
+) -> None:
+    from hermes_cli import kanban_fleet as fleet
+
+    registry = fleet_home / registry_relative
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    writer = sqlite3.connect(registry)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("CREATE TABLE projects (id TEXT PRIMARY KEY)")
+    writer.execute("INSERT INTO projects (id) VALUES ('p_known')")
+    writer.commit()
+    secret = "registry-race-ghp_" + "A" * 24
+    committed = False
+
+    def commit_before_registry_snapshot(path: Path, immutable: bool) -> None:
+        nonlocal committed
+        if path == registry.resolve() and not committed:
+            writer.execute("INSERT INTO projects (id) VALUES (?)", (secret,))
+            writer.commit()
+            committed = True
+
+    monkeypatch.setattr(fleet, "_after_readonly_connect", commit_before_registry_snapshot)
+    try:
+        ledger = fleet.build_fleet_ledger(root=fleet_home, now=123)
+    finally:
+        writer.close()
+
+    assert committed
+    assert ledger["verdict"] == "NOT_VERIFIED"
+    assert ledger["completeness"]["projects"] is False
+    assert ledger["errors"] == {
+        "count": 1,
+        "items": [{"scope": "projects", "code": "project_registry_read_failed"}],
+        "omitted": 0,
+    }
+    assert secret not in json.dumps(ledger)
+
+
+def test_project_registry_programming_errors_propagate(
+    fleet_home: Path, monkeypatch
+) -> None:
+    from hermes_cli import kanban_fleet as fleet
+
+    registry = fleet_home / "projects.db"
+    with sqlite3.connect(registry) as conn:
+        conn.execute("CREATE TABLE projects (id TEXT PRIMARY KEY)")
+
+    original_connect = fleet._readonly_connect
+
+    def selective_programming_error(path: Path) -> sqlite3.Connection:
+        if path == registry:
+            raise RuntimeError("programming error")
+        return original_connect(path)
+
+    monkeypatch.setattr(fleet, "_readonly_connect", selective_programming_error)
+
+    with pytest.raises(RuntimeError, match="programming error"):
+        fleet.build_fleet_ledger(root=fleet_home, now=123)
 
 
 def test_mixed_profile_discovery_failure_cannot_establish_profile_absence(
@@ -494,6 +560,173 @@ def test_board_snapshot_is_coherent_under_concurrent_write(
     assert alpha["snapshot"]["verdict"] == "VERIFIED"
 
 
+def test_readonly_connect_never_verifies_state_stale_before_connect(
+    fleet_home: Path, monkeypatch
+) -> None:
+    from hermes_cli import kanban_fleet as fleet
+
+    alpha_path = fleet_home / "kanban" / "boards" / "alpha" / "kanban.db"
+    writers: list[sqlite3.Connection] = []
+
+    def commit_between_preflight_and_connect(path: Path, immutable: bool) -> None:
+        if path != alpha_path.resolve() or not immutable or writers:
+            return
+        writer = kb.connect(board="alpha")
+        writers.append(writer)
+        task_id = kb.create_task(writer, title="committed before observer connect")
+        assert task_id
+
+    monkeypatch.setattr(
+        fleet, "_before_readonly_connect", commit_between_preflight_and_connect, raising=False
+    )
+    try:
+        ledger = fleet.build_fleet_ledger(
+            root=fleet_home,
+            known_profiles={"default"},
+            known_project_ids={"p_known"},
+            now=123,
+        )
+    finally:
+        for writer in writers:
+            writer.close()
+
+    assert writers
+    if ledger["verdict"] == "VERIFIED":
+        alpha = next(board for board in ledger["boards"] if board["slug"] == "alpha")
+        assert alpha["counts"] == {"ready": 1}
+    else:
+        assert ledger["completeness"]["boards"] is False
+        assert {item["code"] for item in ledger["errors"]["items"]} & {
+            "board_snapshot_drift",
+            "board_snapshot_read_failed",
+        }
+
+
+def test_readonly_connect_pins_snapshot_before_returning(
+    fleet_home: Path, monkeypatch
+) -> None:
+    from hermes_cli import kanban_fleet as fleet
+
+    alpha_path = fleet_home / "kanban" / "boards" / "alpha" / "kanban.db"
+    writers: list[sqlite3.Connection] = []
+
+    def commit_after_connect_before_snapshot(path: Path, immutable: bool) -> None:
+        if path != alpha_path.resolve() or writers:
+            return
+        writer = kb.connect(board="alpha")
+        writers.append(writer)
+        task_id = kb.create_task(writer, title="committed before snapshot pin")
+        assert task_id
+
+    monkeypatch.setattr(
+        fleet,
+        "_after_readonly_connect",
+        commit_after_connect_before_snapshot,
+        raising=False,
+    )
+    try:
+        ledger = fleet.build_fleet_ledger(
+            root=fleet_home,
+            known_profiles={"default"},
+            known_project_ids={"p_known"},
+            now=123,
+        )
+    finally:
+        for writer in writers:
+            writer.close()
+
+    assert writers
+    if ledger["verdict"] == "VERIFIED":
+        alpha = next(board for board in ledger["boards"] if board["slug"] == "alpha")
+        assert alpha["counts"] == {"ready": 1}
+    else:
+        assert ledger["completeness"]["boards"] is False
+        assert {item["code"] for item in ledger["errors"]["items"]} & {
+            "board_snapshot_drift",
+            "board_snapshot_read_failed",
+        }
+
+
+def test_readonly_connect_fails_closed_if_active_wal_disappears_before_open(
+    fleet_home: Path, monkeypatch
+) -> None:
+    from hermes_cli import kanban_fleet as fleet
+
+    alpha_path = fleet_home / "kanban" / "boards" / "alpha" / "kanban.db"
+    writer = kb.connect(board="alpha")
+    task_id = kb.create_task(writer, title="checkpointed during observer open")
+    assert task_id
+    assert Path(f"{alpha_path}-wal").exists()
+
+    def close_writer_before_open(path: Path, immutable: bool) -> None:
+        if path == alpha_path.resolve() and not immutable:
+            writer.close()
+
+    monkeypatch.setattr(fleet, "_before_readonly_connect", close_writer_before_open)
+    try:
+        ledger = fleet.build_fleet_ledger(
+            root=fleet_home,
+            known_profiles={"default"},
+            known_project_ids={"p_known"},
+            now=123,
+        )
+    finally:
+        try:
+            writer.close()
+        except sqlite3.ProgrammingError:
+            pass
+
+    assert ledger["verdict"] == "NOT_VERIFIED"
+    assert ledger["completeness"]["boards"] is False
+    assert [board["slug"] for board in ledger["boards"]] == ["beta"]
+    assert ledger["errors"]["items"] == [
+        {"scope": "boards", "code": "board_snapshot_drift"}
+    ]
+
+
+def test_readonly_connect_fails_closed_if_wal_changes_inside_sqlite_open(
+    fleet_home: Path, monkeypatch
+) -> None:
+    from hermes_cli import kanban_fleet as fleet
+
+    alpha_path = fleet_home / "kanban" / "boards" / "alpha" / "kanban.db"
+    real_connect = sqlite3.connect
+    writers: list[sqlite3.Connection] = []
+
+    def connect_with_commit(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        target = str(args[0]) if args else ""
+        if quote(str(alpha_path.resolve())) in target and not writers:
+            writer = real_connect(alpha_path)
+            writer.execute(
+                "INSERT INTO tasks (id, title, status, created_at) VALUES (?, ?, ?, ?)",
+                ("race", "race", "ready", 123),
+            )
+            writer.commit()
+            writers.append(writer)
+        return conn
+
+    monkeypatch.setattr(fleet.sqlite3, "connect", connect_with_commit)
+    try:
+        ledger = fleet.build_fleet_ledger(
+            root=fleet_home,
+            known_profiles={"default"},
+            known_project_ids={"p_known"},
+            now=123,
+        )
+    finally:
+        for writer in writers:
+            writer.close()
+
+    assert writers
+    assert ledger["verdict"] == "NOT_VERIFIED"
+    assert ledger["completeness"]["boards"] is False
+    assert [board["slug"] for board in ledger["boards"]] == ["beta"]
+    assert ledger["errors"]["items"] == [
+        {"scope": "boards", "code": "board_snapshot_drift"}
+    ]
+
+
 def test_board_snapshot_rejects_identity_drift(
     fleet_home: Path, monkeypatch
 ) -> None:
@@ -526,6 +759,37 @@ def test_board_snapshot_rejects_identity_drift(
     assert ledger["errors"]["items"] == [
         {"scope": "boards", "code": "board_snapshot_drift"}
     ]
+
+
+def test_malformed_dynamic_owner_metadata_omits_board_and_fails_closed(
+    fleet_home: Path
+) -> None:
+    from hermes_cli import kanban_fleet as fleet
+
+    secret = "not-a-pid-ghp_" + "A" * 24
+    with kb.connect_closing(board="alpha") as conn:
+        task_id = kb.create_task(conn, title="malformed owner")
+        assert kb.claim_task(conn, task_id, claimer="default") is not None
+        conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (secret, task_id))
+        conn.execute(
+            "UPDATE task_runs SET worker_pid = NULL WHERE task_id = ? AND ended_at IS NULL",
+            (task_id,),
+        )
+
+    ledger = fleet.build_fleet_ledger(
+        root=fleet_home,
+        known_profiles={"default"},
+        known_project_ids={"p_known"},
+        now=123,
+    )
+
+    assert ledger["verdict"] == "NOT_VERIFIED"
+    assert ledger["completeness"]["boards"] is False
+    assert [board["slug"] for board in ledger["boards"]] == ["beta"]
+    assert ledger["errors"]["items"] == [
+        {"scope": "boards", "code": "board_snapshot_read_failed"}
+    ]
+    assert secret not in json.dumps(ledger)
 
 
 def test_pid_reuse_and_permission_ambiguity_are_never_dead(monkeypatch) -> None:

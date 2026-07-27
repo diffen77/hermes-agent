@@ -54,18 +54,64 @@ class _BoundedErrors:
             self.items.append({"scope": scope, "code": code})
 
 
+def _file_generation(path: Path) -> tuple[int, int, int, int, int]:
+    info = path.stat()
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def _optional_file_generation(path: Path) -> tuple[int, int, int, int, int] | None:
+    try:
+        return _file_generation(path)
+    except FileNotFoundError:
+        return None
+
+
+def _before_readonly_connect(path: Path, immutable: bool) -> None:
+    """Test seam after immutable preflight and before SQLite opens the file."""
+
+
+def _after_readonly_connect(path: Path, immutable: bool) -> None:
+    """Test seam after SQLite opens the file and before snapshot pinning."""
+
+
 def _readonly_connect(path: Path) -> sqlite3.Connection:
     resolved = path.resolve()
     wal = Path(f"{resolved}-wal")
+    shm = Path(f"{resolved}-shm")
     # A clean, closed database can be opened immutable, which prevents even
     # SQLite's transient empty -wal/-shm creation. An active WAL must remain
-    # visible, so use ordinary read-only mode when it contains frames.
-    immutable = not wal.exists() or wal.stat().st_size == 0
+    # visible, so use ordinary read-only mode when it contains frames. Such a
+    # connection requires an existing SHM file: otherwise SQLite may create a
+    # sidecar even in mode=ro, violating this observer's no-side-effect contract.
+    db_before = _file_generation(resolved)
+    wal_before = _optional_file_generation(wal)
+    immutable = wal_before is None or wal_before[2] == 0
+    shm_before = _optional_file_generation(shm)
+    if not immutable and shm_before is None:
+        raise _ObservationDriftError("active WAL has no readable SHM")
+    _before_readonly_connect(resolved, immutable)
     uri = f"file:{quote(str(resolved))}?mode=ro" + ("&immutable=1" if immutable else "")
     conn = sqlite3.connect(uri, uri=True, timeout=1.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA query_only=ON")
-    return conn
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        _after_readonly_connect(resolved, immutable)
+        conn.execute("BEGIN")
+        # BEGIN is deferred in SQLite. Reading schema_version pins the coherent
+        # database/WAL snapshot before this connection can escape to a caller.
+        conn.execute("PRAGMA schema_version").fetchone()
+        if (
+            db_before != _file_generation(resolved)
+            or wal_before != _optional_file_generation(wal)
+            or shm_before != _optional_file_generation(shm)
+        ):
+            raise _ObservationDriftError("database changed before snapshot pin")
+        return conn
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        conn.close()
+        raise
 
 
 def _record_error(errors: _BoundedErrors, scope: str, code: str) -> None:
@@ -236,7 +282,7 @@ def _known_project_ids(
                     for row in conn.execute("SELECT id FROM projects")
                     if row[0]
                 )
-        except (OSError, sqlite3.Error):
+        except (_ObservationDriftError, OSError, sqlite3.Error):
             complete = False
             _record_error(errors, "projects", "project_registry_read_failed")
     return ids, complete
@@ -499,7 +545,6 @@ def _board_ledger(
 ) -> dict[str, object]:
     identity_before = _path_identity(path)
     with closing(_readonly_connect(path)) as conn:
-        conn.execute("BEGIN")
         schema_before = int(conn.execute("PRAGMA schema_version").fetchone()[0])
         data_before = int(conn.execute("PRAGMA data_version").fetchone()[0])
         tasks = [dict(row) for row in conn.execute(_TASK_SELECT)]
@@ -647,7 +692,10 @@ def build_fleet_ledger(
         except _ObservationDriftError:
             boards_complete = False
             _record_error(errors, "boards", "board_snapshot_drift")
-        except (OSError, sqlite3.Error):
+        except (OSError, sqlite3.Error, TypeError, ValueError, OverflowError):
+            # Dynamic SQLite metadata is untrusted. Conversion failures for
+            # owner/run ids, PIDs, or timestamps omit the whole board rather
+            # than escaping or projecting a partially trustworthy snapshot.
             boards_complete = False
             _record_error(errors, "boards", "board_snapshot_read_failed")
     completeness = {
