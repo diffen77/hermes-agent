@@ -5344,19 +5344,27 @@ def authorize_factory_effect(
         ).fetchone()[0]
         if effect in ("source_write", "commit", "push") and int(leases) != 2:
             raise FactoryEnforcementError("active source/git lease set missing")
-        if function_name in ("write_file", "patch"):
+        if function_name in ("write_file", "patch", "terminal"):
             binding = conn.execute(
                 "SELECT workspace_root FROM factory_task_bindings WHERE task_id=?",
                 (task_id,),
             ).fetchone()
-            raw_path = str(function_args.get("path") or "")
-            candidate = Path(raw_path)
-            if not candidate.is_absolute():
-                candidate = Path(binding["workspace_root"]) / candidate
             workspace = Path(binding["workspace_root"]).resolve(strict=False)
+            if function_name == "terminal":
+                raw_workdir = str(function_args.get("workdir") or "")
+                candidate = Path(raw_workdir) if raw_workdir else workspace
+            else:
+                raw_path = str(function_args.get("path") or "")
+                candidate = Path(raw_path)
+                if not candidate.is_absolute():
+                    candidate = workspace / candidate
             resolved = candidate.resolve(strict=False)
             if os.path.commonpath((str(workspace), str(resolved))) != str(workspace):
+                if function_name == "terminal":
+                    raise FactoryEnforcementError("terminal workdir is outside bound workspace")
                 raise FactoryEnforcementError("file mutation escapes bound workspace")
+            if function_name == "terminal":
+                function_args["workdir"] = str(resolved)
     except (FactoryEnforcementError, ValueError) as exc:
         denial = str(exc)
     if denial is not None:

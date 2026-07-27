@@ -113,3 +113,44 @@ def test_mutation_middleware_denies_task_scope_mismatch_and_process_side_effects
         "process", {"action": "kill", "session_id": "bg-1"}, task_id
     )
     assert process_block is not None
+
+
+def test_factory_terminal_workdir_is_pinned_to_authorized_workspace(
+    tmp_path: Path, monkeypatch
+):
+    workspace = tmp_path / "repo" / "worktree"
+    workspace.mkdir(parents=True)
+    db_path = tmp_path / "kanban.db"
+    with kb.connect(db_path) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="terminal guard",
+            assignee="john",
+            project_id="p_102c8528",
+            enforcement_version="factory-v1",
+            project_binding=_binding(str(workspace)),
+            board="factory",
+        )
+        task = kb.claim_task(conn, task_id, claimer="writer")
+        auth_id = conn.execute(
+            "SELECT id FROM factory_authorizations WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_FACTORY_EXECUTION_GENERATION", str(task.execution_generation))
+    monkeypatch.setenv("HERMES_FACTORY_AUTHORIZATION_ID", auth_id)
+    monkeypatch.setenv("HERMES_FACTORY_BINDING_DIGEST", task.project_binding_digest)
+
+    args = {"command": "git status --short"}
+    assert _factory_mutation_block("terminal", args, task_id) is None
+    assert args["workdir"] == str(workspace.resolve())
+
+    denial = _factory_mutation_block(
+        "terminal",
+        {"command": "git status --short", "workdir": str(tmp_path.parent)},
+        task_id,
+    )
+    assert denial is not None
+    assert "outside bound workspace" in denial
